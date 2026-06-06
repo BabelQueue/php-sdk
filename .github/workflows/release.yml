@@ -12,7 +12,7 @@ jobs:
     name: Validate (tests green before publishing)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -33,7 +33,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
