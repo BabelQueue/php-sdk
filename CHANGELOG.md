@@ -10,6 +10,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ## [Unreleased]
 
 ### Added
+- `EnvelopeCodec::urn()` — resolve the message URN (`job`, accepting `urn` as an
+  inbound alias).
+- `EnvelopeCodec::accepts()` — consumer-side envelope validation (rejects an empty
+  URN, an unsupported `meta.schema_version`, a blank `trace_id`, non-object `data`
+  or non-integer `attempts`).
+- Shared **cross-SDK conformance suite** under `tests/conformance/` (vendored from
+  the canonical `conformance/` set) plus a `ConformanceTest` runner.
+
+## [0.1.0] - 2026-06-06
+
+### Added
 - `Codec\EnvelopeCodec` — builds, encodes and decodes the canonical
   `{job, trace_id, data, meta, attempts}` envelope (`SCHEMA_VERSION`, `SOURCE_LANG`).
   The single PHP implementation of the wire format.
@@ -25,4 +36,5 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/commits/main
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/BabelQueue/php-sdk/releases/tag/v0.1.0

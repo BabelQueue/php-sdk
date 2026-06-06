@@ -93,6 +93,48 @@ final class EnvelopeCodec
     }
 
     /**
+     * The message URN: canonical "job", with "urn" accepted as an inbound alias.
+     *
+     * @param  array<string, mixed>  $envelope
+     */
+    public static function urn(array $envelope): string
+    {
+        return (string) ($envelope['job'] ?? $envelope['urn'] ?? '');
+    }
+
+    /**
+     * Whether a consumer should accept this envelope (consumer-side validation):
+     * a non-empty URN, a supported meta.schema_version, a non-blank trace_id, an
+     * object "data" and an integer "attempts". Accepts the "urn" alias (unlike the
+     * producer JSON Schema, which requires "job").
+     *
+     * @param  array<string, mixed>  $envelope
+     */
+    public static function accepts(array $envelope): bool
+    {
+        if (self::urn($envelope) === '') {
+            return false;
+        }
+
+        $meta = $envelope['meta'] ?? null;
+        if (! is_array($meta) || ($meta['schema_version'] ?? null) !== self::SCHEMA_VERSION) {
+            return false;
+        }
+
+        if (! is_array($envelope['data'] ?? null)) {
+            return false;
+        }
+
+        if (! is_int($envelope['attempts'] ?? null)) {
+            return false;
+        }
+
+        $traceId = $envelope['trace_id'] ?? null;
+
+        return is_string($traceId) && $traceId !== '';
+    }
+
+    /**
      * Resolve and validate the job's URN. A blank URN is a programming error.
      *
      * @throws BabelQueueException
