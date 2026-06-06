@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate (tests green before publishing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: json
+          coverage: none
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Run tests
+        run: vendor/bin/phpunit
+
+  release:
+    name: Publish
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+      # Packagist normally auto-updates via its GitHub webhook. If you instead set
+      # PACKAGIST_USERNAME / PACKAGIST_TOKEN secrets, this pings its API.
+      # Release order matters: publish babelqueue/php-sdk BEFORE its adapters.
+      - name: Notify Packagist (optional)
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          if [ -n "$PACKAGIST_TOKEN" ]; then
+            curl -sf -XPOST -H 'content-type:application/json' \
+              "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+              -d '{"repository":{"url":"https://github.com/BabelQueue/php-sdk"}}'
+          else
+            echo "Packagist secrets not set — relying on the Packagist GitHub webhook."
+          fi

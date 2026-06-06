@@ -46,4 +46,26 @@ final class DeadLetterTest extends TestCase
         $this->assertNull($out['dead_letter']['error']);
         $this->assertNull($out['dead_letter']['exception']);
     }
+
+    public function test_block_shape_matches_the_golden_fixture(): void
+    {
+        $fixture = json_decode((string) file_get_contents(__DIR__ . '/fixtures/dead-lettered.json'), true);
+        $base = json_decode((string) file_get_contents(__DIR__ . '/fixtures/order-created.json'), true);
+
+        $out = DeadLetter::annotate(
+            $base,
+            'failed',
+            new RuntimeException('Payment gateway timeout'),
+            'orders',
+            3,
+        );
+
+        // Same dead_letter keys, in the same order, as the canonical fixture.
+        $this->assertSame(array_keys($fixture['dead_letter']), array_keys($out['dead_letter']));
+        $this->assertSame($fixture['dead_letter']['reason'], $out['dead_letter']['reason']);
+        $this->assertSame($fixture['dead_letter']['original_queue'], $out['dead_letter']['original_queue']);
+        // The wrapped original envelope is preserved verbatim.
+        $this->assertSame($base['job'], $out['job']);
+        $this->assertSame($base['trace_id'], $out['trace_id']);
+    }
 }

@@ -16,6 +16,11 @@
             "email": "info@muhammetsafak.com.tr"
         }
     ],
+    "homepage": "https://babelqueue.com",
+    "support": {
+        "issues": "https://github.com/BabelQueue/php-sdk/issues",
+        "source": "https://github.com/BabelQueue/php-sdk"
+    },
     "require": {
         "php": "^8.2",
         "ext-json": "*"
