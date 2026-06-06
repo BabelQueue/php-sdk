@@ -15,6 +15,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - `EnvelopeCodec::accepts()` — consumer-side envelope validation (rejects an empty
   URN, an unsupported `meta.schema_version`, a blank `trace_id`, non-object `data`
   or non-integer `attempts`).
+- `Validation\EnvelopeValidator` — consumer-side validation *with a reason*
+  (`check()`/`isValid()`/`validate()`). `isUnsupportedSchemaVersion()` and the
+  `REASON_UNSUPPORTED_SCHEMA_VERSION` reason let a consumer **quarantine** a
+  message from a newer producer instead of silently dropping it.
+  `Exceptions\InvalidEnvelopeException` carries the reason and the offending
+  envelope.
+- Framework-less reference transports implementing `Contracts\Transport` for use
+  without Laravel/Symfony: `Transport\RedisTransport` (`RPUSH` onto the shared
+  list, interoperable with every SDK's reliable-queue consumer) and
+  `Transport\AmqpTransport` (durable queue, persistent message, contract AMQP
+  properties: `type`=URN, `correlation_id`=`trace_id`, `message_id`=`meta.id`,
+  `x-schema-version`/`x-source-lang`/`x-attempts`). Their broker clients
+  (`predis/predis`, `php-amqplib/php-amqplib`) are **optional** — declared under
+  `suggest`, not `require`, so the core stays dependency-free.
 - Shared **cross-SDK conformance suite** under `tests/conformance/` (vendored from
   the canonical `conformance/` set) plus a `ConformanceTest` runner.
 

@@ -29,15 +29,48 @@ composer require babelqueue/php-sdk
 | | `BabelQueue\Contracts\HasBabelUrn` / `HasTraceId` | URN identity / optional trace-id propagation. |
 | | `BabelQueue\Contracts\InboundMessage` | Read-only decoded view of a consumed envelope. |
 | | `BabelQueue\Contracts\Transport` | Minimal publish seam (framework-less / adapter use). |
+| Validation | `BabelQueue\Validation\EnvelopeValidator` | Consumer-side validation **with a reason** — quarantine an unsupported `meta.schema_version` instead of dropping it. |
+| Transports | `BabelQueue\Transport\RedisTransport` / `AmqpTransport` | Optional framework-less reference `Transport` impls (Redis `RPUSH`; RabbitMQ durable + contract AMQP properties). |
 | Dead-letter | `BabelQueue\DeadLetter\DeadLetter` | Annotate an envelope with the additive `dead_letter` block (ADR-0009). |
 | Routing | `BabelQueue\Routing\UnknownUrnStrategy` | `fail` / `delete` / `release` / `dead_letter` constants. |
 | Support | `BabelQueue\Support\Uuid` | Dependency-free UUIDv4 (no ramsey/symfony-uid needed). |
-| Errors | `BabelQueue\Exceptions\BabelQueueException` / `UnknownUrnException` | Two-level exception hierarchy. |
+| Errors | `BabelQueue\Exceptions\BabelQueueException` / `UnknownUrnException` / `InvalidEnvelopeException` | Exception hierarchy; `InvalidEnvelopeException` carries the rejection reason + envelope. |
 
 The contract this core implements — the canonical envelope, URN scheme, broker
 bindings and versioning policy — is documented at
 [babelqueue.com](https://babelqueue.com). The golden conformance fixtures live in
 [`tests/fixtures/`](tests/fixtures/) — every PHP package must round-trip them.
+
+## Framework-less use
+
+Produce the canonical envelope from a plain PHP app and let any other SDK consume
+it. The reference transports keep the core dependency-free — install only the
+broker client you use:
+
+```bash
+composer require predis/predis              # for RedisTransport
+composer require php-amqplib/php-amqplib    # for AmqpTransport
+```
+
+```php
+use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\Transport\RedisTransport;
+use BabelQueue\Validation\EnvelopeValidator;
+
+// Produce — a Go/Python/Node consumer reads the identical envelope off "orders".
+$transport = new RedisTransport(new Predis\Client('redis://localhost:6379'));
+$transport->publish(EnvelopeCodec::encode(EnvelopeCodec::fromJob($job, 'orders')), 'orders');
+
+// Consume (your own loop) — validate before dispatch, quarantine the unknown.
+$envelope = EnvelopeCodec::decode($rawBody);
+if ($reason = EnvelopeValidator::check($envelope)) {
+    // $reason === 'unsupported_schema_version' → dead-letter, don't drop.
+    return;
+}
+```
+
+phpredis (`ext-redis`) users can implement the one-method `Transport` directly —
+it is just an `rpush`.
 
 ## Design
 

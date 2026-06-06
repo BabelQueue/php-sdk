@@ -26,7 +26,15 @@
         "ext-json": "*"
     },
     "require-dev": {
-        "phpunit/phpunit": "^10.5|^11.0"
+        "mockery/mockery": "^1.6",
+        "php-amqplib/php-amqplib": "^3.5",
+        "phpunit/phpunit": "^10.5|^11.0",
+        "predis/predis": "^2.2"
+    },
+    "suggest": {
+        "ext-redis": "Use the phpredis extension with your own one-method Transport, or install predis/predis for the bundled RedisTransport.",
+        "php-amqplib/php-amqplib": "For the framework-less RabbitMQ transport (BabelQueue\\Transport\\AmqpTransport).",
+        "predis/predis": "Pure-PHP Redis client for the framework-less Redis transport (BabelQueue\\Transport\\RedisTransport)."
     },
     "autoload": {
         "psr-4": {
