@@ -7,7 +7,7 @@ namespace BabelQueue\Routing;
 /**
  * The canonical names for what a consumer does with a message whose URN has no
  * mapped handler. Every SDK MUST offer the same four, with the same semantics
- * (see ../../.ssot/contracts/error-handling.md).
+ * (see https://babelqueue.com).
  */
 final class UnknownUrnStrategy
 {

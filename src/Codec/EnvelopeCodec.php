@@ -20,13 +20,13 @@ use BabelQueue\Support\Uuid;
  * cross-service correlation id preserved across every hop; PHP's native
  * serialize() is never involved.
  *
- * Full spec: ../../.ssot/contracts/message-envelope.md
+ * Full spec: https://babelqueue.com
  */
 final class EnvelopeCodec
 {
     /**
      * Bumped only on a breaking envelope change, so consumers can refuse
-     * messages they do not understand. See ../../.ssot/contracts/versioning-policy.md.
+     * messages they do not understand.
      */
     public const SCHEMA_VERSION = 1;
 

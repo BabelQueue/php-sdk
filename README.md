@@ -34,16 +34,16 @@ composer require babelqueue/php-sdk
 | Support | `BabelQueue\Support\Uuid` | Dependency-free UUIDv4 (no ramsey/symfony-uid needed). |
 | Errors | `BabelQueue\Exceptions\BabelQueueException` / `UnknownUrnException` | Two-level exception hierarchy. |
 
-The contract this core implements is defined in the project SSOT:
-[`.ssot/contracts/`](../.ssot/contracts/). The golden conformance fixtures live in
+The contract this core implements — the canonical envelope, URN scheme, broker
+bindings and versioning policy — is documented at
+[babelqueue.com](https://babelqueue.com). The golden conformance fixtures live in
 [`tests/fixtures/`](tests/fixtures/) — every PHP package must round-trip them.
 
 ## Design
 
 This core is the **contract runtime**, not a worker. It does not own a broker
 loop or retry — adapters bind to each framework's native queue (Laravel's
-drop-in driver, Symfony Messenger) and reuse that framework's worker/retry. See
-[ADR-0010](../.ssot/architecture/adr/0010-framework-agnostic-php-core.md).
+drop-in driver, Symfony Messenger) and reuse that framework's worker/retry.
 
 ## Testing
 
