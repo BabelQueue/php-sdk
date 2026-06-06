@@ -1,0 +1,41 @@
+{
+    "name": "babelqueue/php-sdk",
+    "description": "Framework-agnostic core for BabelQueue: the canonical polyglot queue envelope codec, contracts and dead-letter helpers. Framework adapters (Laravel, Symfony, ...) are built on top.",
+    "keywords": [
+        "queue",
+        "polyglot",
+        "microservices",
+        "json",
+        "envelope"
+    ],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Muhammet Şafak",
+            "email": "info@muhammetsafak.com.tr"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5|^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "BabelQueue\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "BabelQueue\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
