@@ -10,11 +10,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ## [Unreleased]
 
 ### Added
-- `EnvelopeCodec::urn()` — resolve the message URN (`job`, accepting `urn` as an
-  inbound alias).
-- `EnvelopeCodec::accepts()` — consumer-side envelope validation (rejects an empty
-  URN, an unsupported `meta.schema_version`, a blank `trace_id`, non-object `data`
-  or non-integer `attempts`).
 - `Validation\EnvelopeValidator` — consumer-side validation *with a reason*
   (`check()`/`isValid()`/`validate()`). `isUnsupportedSchemaVersion()` and the
   `REASON_UNSUPPORTED_SCHEMA_VERSION` reason let a consumer **quarantine** a
@@ -29,6 +24,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `x-schema-version`/`x-source-lang`/`x-attempts`). Their broker clients
   (`predis/predis`, `php-amqplib/php-amqplib`) are **optional** — declared under
   `suggest`, not `require`, so the core stays dependency-free.
+
+## [0.2.0] - 2026-06-06
+
+### Added
+- `EnvelopeCodec::urn()` — resolve the message URN (`job`, accepting `urn` as an
+  inbound alias).
+- `EnvelopeCodec::accepts()` — consumer-side envelope validation (rejects an empty
+  URN, an unsupported `meta.schema_version`, a blank `trace_id`, non-object `data`
+  or non-integer `attempts`).
 - Shared **cross-SDK conformance suite** under `tests/conformance/` (vendored from
   the canonical `conformance/` set) plus a `ConformanceTest` runner.
 
@@ -50,5 +54,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/php-sdk/releases/tag/v0.1.0
