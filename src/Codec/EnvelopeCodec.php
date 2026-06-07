@@ -99,7 +99,9 @@ final class EnvelopeCodec
      */
     public static function urn(array $envelope): string
     {
-        return (string) ($envelope['job'] ?? $envelope['urn'] ?? '');
+        $urn = $envelope['job'] ?? $envelope['urn'] ?? '';
+
+        return is_string($urn) ? $urn : '';
     }
 
     /**

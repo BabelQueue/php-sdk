@@ -109,6 +109,30 @@ final class EnvelopeCodecTest extends TestCase
         $this->assertSame($fixture['data'], $payload['data']);
         $this->assertSame($fixture['meta']['lang'], $payload['meta']['lang']);
     }
+
+    public function test_accepts_validates_consumer_envelopes(): void
+    {
+        $valid = [
+            'job' => 'urn:babel:orders:created',
+            'trace_id' => 'trace-1',
+            'data' => ['order_id' => 1042],
+            'meta' => ['id' => 'm1', 'schema_version' => EnvelopeCodec::SCHEMA_VERSION],
+            'attempts' => 0,
+        ];
+        $this->assertTrue(EnvelopeCodec::accepts($valid));
+
+        // The "urn" alias is accepted on the consumer side.
+        $aliased = ['urn' => 'urn:babel:orders:created'] + $valid;
+        unset($aliased['job']);
+        $this->assertTrue(EnvelopeCodec::accepts($aliased));
+
+        $this->assertFalse(EnvelopeCodec::accepts(['trace_id' => 't', 'data' => [], 'meta' => ['schema_version' => 1], 'attempts' => 0]), 'missing URN');
+        $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => 't', 'data' => [], 'attempts' => 0]), 'missing meta');
+        $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => 't', 'data' => [], 'meta' => ['schema_version' => 2], 'attempts' => 0]), 'unsupported schema_version');
+        $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => 't', 'data' => 'x', 'meta' => ['schema_version' => 1], 'attempts' => 0]), 'non-object data');
+        $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => 't', 'data' => [], 'meta' => ['schema_version' => 1], 'attempts' => '0']), 'non-integer attempts');
+        $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => '', 'data' => [], 'meta' => ['schema_version' => 1], 'attempts' => 0]), 'blank trace_id');
+    }
 }
 
 class OrderJobStub implements PolyglotJob

@@ -29,7 +29,7 @@ final class RedisTransport implements Transport
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
-        $this->client->rpush($queue ?? $this->defaultQueue, $payload);
+        $this->client->rpush($queue ?? $this->defaultQueue, [$payload]);
 
         // Redis lists carry no broker-assigned id; the envelope's own meta.id is
         // the message identity. Returning null keeps the contract honest.

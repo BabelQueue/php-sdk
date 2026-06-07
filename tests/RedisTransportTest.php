@@ -21,7 +21,7 @@ final class RedisTransportTest extends TestCase
     public function test_publish_rpushes_the_payload_onto_the_named_queue(): void
     {
         $client = Mockery::mock(ClientInterface::class);
-        $client->shouldReceive('rpush')->once()->with('orders', '{"job":"x"}');
+        $client->shouldReceive('rpush')->once()->with('orders', ['{"job":"x"}']);
 
         $transport = new RedisTransport($client, 'default');
 
@@ -31,7 +31,7 @@ final class RedisTransportTest extends TestCase
     public function test_publish_falls_back_to_the_default_queue(): void
     {
         $client = Mockery::mock(ClientInterface::class);
-        $client->shouldReceive('rpush')->once()->with('default', 'payload');
+        $client->shouldReceive('rpush')->once()->with('default', ['payload']);
 
         (new RedisTransport($client, 'default'))->publish('payload');
     }

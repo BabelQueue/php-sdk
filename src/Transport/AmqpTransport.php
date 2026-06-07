@@ -44,8 +44,9 @@ final class AmqpTransport implements Transport
         $this->channel->basic_publish($this->toMessage($payload, $envelope), '', $target);
 
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
+        $id = $meta['id'] ?? null;
 
-        return isset($meta['id']) ? (string) $meta['id'] : null;
+        return is_scalar($id) ? (string) $id : null;
     }
 
     /**
@@ -72,7 +73,7 @@ final class AmqpTransport implements Transport
             $properties['correlation_id'] = $traceId;
         }
 
-        if (isset($meta['id'])) {
+        if (isset($meta['id']) && is_scalar($meta['id'])) {
             $properties['message_id'] = (string) $meta['id'];
         }
 

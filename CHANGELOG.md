@@ -9,6 +9,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- `EnvelopeCodec::urn()` returns `''` for a non-string `job`/`urn` instead of
+  coercing it; a non-string URN is then rejected by `accepts()` /
+  `EnvelopeValidator` (URNs must be strings — GR-2).
+
+### Internal
+- CI runs **PHPStan (level 9)** over `src` and enforces a **>=90% line-coverage
+  gate** (`bin/check-coverage.php`). Locally: `composer analyse`,
+  `composer test:coverage`, `composer coverage:check`.
+
+## [0.3.0] - 2026-06-06
+
 ### Added
 - `Validation\EnvelopeValidator` — consumer-side validation *with a reason*
   (`check()`/`isValid()`/`validate()`). `isUnsupportedSchemaVersion()` and the
@@ -54,6 +66,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/php-sdk/releases/tag/v0.1.0
