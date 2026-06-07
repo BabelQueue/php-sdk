@@ -133,6 +133,50 @@ final class EnvelopeCodecTest extends TestCase
         $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => 't', 'data' => [], 'meta' => ['schema_version' => 1], 'attempts' => '0']), 'non-integer attempts');
         $this->assertFalse(EnvelopeCodec::accepts(['job' => 'u', 'trace_id' => '', 'data' => [], 'meta' => ['schema_version' => 1], 'attempts' => 0]), 'blank trace_id');
     }
+
+    public function test_make_builds_the_canonical_envelope_from_urn_and_data(): void
+    {
+        $payload = EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 7], 'orders');
+
+        $this->assertSame(['job', 'trace_id', 'data', 'meta', 'attempts'], array_keys($payload));
+        $this->assertSame('urn:babel:orders:created', $payload['job']);
+        $this->assertSame(['order_id' => 7], $payload['data']);
+        $this->assertSame('orders', $payload['meta']['queue']);
+        $this->assertSame('php', $payload['meta']['lang']);
+        $this->assertSame(1, $payload['meta']['schema_version']);
+        $this->assertSame(0, $payload['attempts']);
+        $this->assertMatchesRegularExpression(self::UUID_PATTERN, $payload['trace_id']);
+        $this->assertMatchesRegularExpression(self::UUID_PATTERN, $payload['meta']['id']);
+    }
+
+    public function test_make_honours_inherited_trace_id_and_defaults_the_queue(): void
+    {
+        $payload = EnvelopeCodec::make('urn:babel:orders:created', [], traceId: 'trace-xyz');
+
+        $this->assertSame('trace-xyz', $payload['trace_id']);
+        $this->assertSame('default', $payload['meta']['queue']);
+    }
+
+    public function test_make_rejects_an_empty_urn(): void
+    {
+        $this->expectException(BabelQueueException::class);
+
+        EnvelopeCodec::make('   ', ['a' => 1]);
+    }
+
+    public function test_from_job_and_make_produce_the_same_shape(): void
+    {
+        $fromJob = EnvelopeCodec::fromJob(new OrderJobStub(), 'orders');
+        $fromMake = EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 1042], 'orders');
+
+        // Identical structure + invariant fields (ids/trace/timestamp are per-message).
+        $this->assertSame(array_keys($fromJob), array_keys($fromMake));
+        $this->assertSame($fromJob['job'], $fromMake['job']);
+        $this->assertSame($fromJob['data'], $fromMake['data']);
+        $this->assertSame($fromJob['meta']['queue'], $fromMake['meta']['queue']);
+        $this->assertSame($fromJob['meta']['lang'], $fromMake['meta']['lang']);
+        $this->assertSame($fromJob['meta']['schema_version'], $fromMake['meta']['schema_version']);
+    }
 }
 
 class OrderJobStub implements PolyglotJob

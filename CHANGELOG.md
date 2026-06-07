@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
+**1.0.0 — the public API is now SemVer-stable**: breaking changes require a MAJOR,
+following the deprecation policy (deprecate → remove across a MINOR window). The
+wire envelope is unchanged and remains `schema_version: 1`. Full reference + the
+contract live at [babelqueue.com](https://babelqueue.com).
+
+### Added
+- `EnvelopeCodec::make(string $urn, array $data, string $queue = 'default', ?string $traceId = null)`
+  — the data-first envelope builder shared by every other SDK (`make`/`Make`).
+  `fromJob()` now delegates to it (byte-identical output). Closes the cross-SDK
+  producer-API parity gap (see [API review](https://babelqueue.com)).
+
 ### Changed
 - `EnvelopeCodec::urn()` returns `''` for a non-string `job`/`urn` instead of
   coercing it; a non-string URN is then rejected by `accepts()` /
@@ -18,6 +31,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - CI runs **PHPStan (level 9)** over `src` and enforces a **>=90% line-coverage
   gate** (`bin/check-coverage.php`). Locally: `composer analyse`,
   `composer test:coverage`, `composer coverage:check`.
+- **GR-8 latency benchmark** (`OverheadBenchmarkTest`) — asserts the envelope
+  encode/decode path adds **≤2%** over plain-JSON serialization vs a conservative
+  750µs broker round-trip.
 
 ## [0.3.0] - 2026-06-06
 
@@ -66,7 +82,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/BabelQueue/php-sdk/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/php-sdk/releases/tag/v0.1.0

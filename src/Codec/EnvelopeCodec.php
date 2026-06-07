@@ -34,25 +34,38 @@ final class EnvelopeCodec
     public const SOURCE_LANG = 'php';
 
     /**
-     * Build the canonical envelope for a polyglot job.
+     * Build the canonical envelope directly from a URN + pure-JSON data — the
+     * data-first entry point shared by every BabelQueue SDK (Go `Make`, Python
+     * `make`, Node/Java/.NET `make`/`Make`). Use {@see fromJob()} when you already
+     * have a {@see PolyglotJob} object.
      *
-     * "trace_id" is inherited when the job implements {@see HasTraceId} (so a
-     * handler can keep a downstream message inside the same trace), otherwise a
-     * fresh UUID is minted. "attempts" is a top-level transport counter kept OUT
-     * of the immutable "meta" block — it also satisfies Laravel's Redis
-     * reservation script, which increments payload.attempts on every pop.
+     * A non-empty `$traceId` continues an existing distributed trace; otherwise a
+     * fresh UUID is minted. "attempts" is a top-level transport counter kept OUT of
+     * the immutable "meta" block.
      *
+     * @param  array<string, mixed>  $data  Pure, JSON-serialisable payload.
      * @param  string  $queue  The logical queue name (not the broker key).
      * @return array{job: string, trace_id: string, data: array<string, mixed>, meta: array<string, mixed>, attempts: int}
      *
-     * @throws BabelQueueException When the job exposes an empty URN.
+     * @throws BabelQueueException When the URN is empty.
      */
-    public static function fromJob(PolyglotJob $job, string $queue): array
+    public static function make(string $urn, array $data = [], string $queue = 'default', ?string $traceId = null): array
     {
+        $resolvedUrn = trim($urn);
+
+        if ($resolvedUrn === '') {
+            throw new BabelQueueException(
+                'EnvelopeCodec::make() requires a non-empty URN so consumers can identify the '
+                . 'message without any language-specific class name.',
+            );
+        }
+
+        $inheritedTrace = $traceId === null ? '' : trim($traceId);
+
         return [
-            'job' => self::resolveUrn($job),
-            'trace_id' => self::resolveTraceId($job),
-            'data' => $job->toPayload(),
+            'job' => $resolvedUrn,
+            'trace_id' => $inheritedTrace !== '' ? $inheritedTrace : Uuid::v4(),
+            'data' => $data,
             'meta' => [
                 'id' => Uuid::v4(),
                 'queue' => $queue,
@@ -62,6 +75,26 @@ final class EnvelopeCodec
             ],
             'attempts' => 0,
         ];
+    }
+
+    /**
+     * Build the canonical envelope for a {@see PolyglotJob} object. Delegates to
+     * {@see make()}; "trace_id" is inherited when the job implements
+     * {@see HasTraceId}, otherwise a fresh UUID is minted.
+     *
+     * @param  string  $queue  The logical queue name (not the broker key).
+     * @return array{job: string, trace_id: string, data: array<string, mixed>, meta: array<string, mixed>, attempts: int}
+     *
+     * @throws BabelQueueException When the job exposes an empty URN.
+     */
+    public static function fromJob(PolyglotJob $job, string $queue): array
+    {
+        return self::make(
+            self::resolveUrn($job),
+            $job->toPayload(),
+            $queue,
+            $job instanceof HasTraceId ? $job->getBabelTraceId() : null,
+        );
     }
 
     /**
@@ -154,24 +187,6 @@ final class EnvelopeCodec
         }
 
         return $urn;
-    }
-
-    /**
-     * Reuse an inherited trace id ({@see HasTraceId}) so the message stays part
-     * of the same distributed trace; otherwise mint a fresh v4 UUID. Distinct
-     * from meta.id, which is unique per message.
-     */
-    private static function resolveTraceId(PolyglotJob $job): string
-    {
-        if ($job instanceof HasTraceId) {
-            $traceId = trim((string) $job->getBabelTraceId());
-
-            if ($traceId !== '') {
-                return $traceId;
-            }
-        }
-
-        return Uuid::v4();
     }
 
     /** Current Unix time in milliseconds (UTC). */
