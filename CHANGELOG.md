@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-12
+
+### Added
+- **Amazon SQS transport** — `BabelQueue\Transport\SqsTransport`, a framework-less SQS
+  producer implementing [§3 of the broker-bindings contract](https://babelqueue.com): it
+  sends the canonical envelope as the `MessageBody` and projects the envelope onto native
+  SQS `MessageAttributes` (`bq-job`/`bq-trace-id`/`bq-message-id`/`bq-schema-version`/
+  `bq-source-lang`/`bq-created-at`; FIFO `MessageGroupId`/`MessageDeduplicationId`). It is
+  decoupled from `aws/aws-sdk-php` behind a one-method `BabelQueue\Transport\SqsClient`
+  seam, so it is dependency-free and unit-testable with a fake (wrap a real
+  `Aws\Sqs\SqsClient` in a one-line adapter — see the class docs). The envelope is
+  unchanged (`schema_version: 1`); SQS is purely additive.
 
 ## [1.0.0] - 2026-06-07
 
@@ -82,7 +93,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/BabelQueue/php-sdk/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/php-sdk/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/BabelQueue/php-sdk/compare/v0.1.0...v0.2.0
