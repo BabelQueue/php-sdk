@@ -12,7 +12,7 @@
     "license": "MIT",
     "authors": [
         {
-            "name": "Muhammet Şafak",
+            "name": "Muhammet \u015eafak",
             "email": "info@muhammetsafak.com.tr"
         }
     ],
@@ -36,7 +36,8 @@
         "ext-redis": "Use the phpredis extension with your own one-method Transport, or install predis/predis for the bundled RedisTransport.",
         "php-amqplib/php-amqplib": "For the framework-less RabbitMQ transport (BabelQueue\\Transport\\AmqpTransport).",
         "predis/predis": "Pure-PHP Redis client for the framework-less Redis transport (BabelQueue\\Transport\\RedisTransport).",
-        "aws/aws-sdk-php": "For the framework-less Amazon SQS transport (BabelQueue\\Transport\\SqsTransport)."
+        "aws/aws-sdk-php": "For the framework-less Amazon SQS transport (BabelQueue\\Transport\\SqsTransport).",
+        "stomp-php/stomp-php": "To produce to Apache ActiveMQ Artemis over STOMP (the \u00a77 PHP path) via StompTransport."
     },
     "autoload": {
         "psr-4": {

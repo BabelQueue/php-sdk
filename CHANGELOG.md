@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.2.0] - 2026-06-14
+
+### Added
+- **Apache ActiveMQ Artemis transport (STOMP)** — `BabelQueue\Transport\StompTransport`, a
+  framework-less Artemis producer over **STOMP** ([§7 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-activemq-artemis),
+  ADR-0018). PHP has no mature native AMQP-1.0 client, so it reaches Artemis over STOMP (the
+  pure-PHP `stomp-php`); Artemis bridges STOMP↔AMQP-1.0↔JMS on the same address, so a message it
+  produces is consumed natively by the Java/.NET/Node/Python/Go Artemis SDKs. The envelope is the
+  frame body; the §7 fields map onto STOMP headers (`correlation-id` = `trace_id`, `content-type`,
+  and the string `bq_schema_version`/`bq_source_lang`/`bq_attempts`/`bq_app_id`). Routing is
+  **body-authoritative** (a STOMP header cannot set the `x-opt-jms-type` annotation, so consumers
+  route on the body's `job` URN). Decoupled from `stomp-php` behind a one-method
+  `BabelQueue\Transport\StompClient` seam — dependency-free and unit-testable with a fake (wrap a
+  real `Stomp\StatefulStomp` in a one-line adapter). `stomp-php/stomp-php` is a Composer
+  **suggest**. Proven live with a PHP(STOMP)→Python(AMQP 1.0) round-trip over a real Artemis. The
+  envelope is unchanged (`schema_version: 1`); a producer transport (PHP consumes Artemis via a
+  framework worker — a Laravel STOMP driver is a follow-up). Ships as a MINOR.
+
 ## [1.1.0] - 2026-06-12
 
 ### Added
