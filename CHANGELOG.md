@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.7.0] - 2026-06-14
+
+### Added
+- **Offline JSON Schema validator** — `BabelQueue\Validation\SchemaValidator`, a dependency-free,
+  producer-side structural validator that checks a decoded envelope against the **bundled** canonical
+  JSON Schema (`src/Validation/message-envelope.schema.json`), so an app can validate an envelope at
+  runtime with **no network access and no JSON-Schema library**. It is the strict counterpart to the
+  lenient consumer-side `EnvelopeValidator`: it requires `job` (no `urn` alias), the full `meta`
+  block, UUID-shaped ids, the `lang` enum and the `schema_version` const, plus the optional
+  `dead_letter` block, returning `"<path>: <reason>"` violations. The bundled schema is byte-identical
+  to the canonical contract/conformance schema (a drift-guard test enforces it). The envelope is
+  unchanged (`schema_version: 1`); purely additive. Ships as a MINOR.
+
+### Internal
+- **CI:** `release.yml` now runs the **≥90% coverage gate** (mirroring `ci.yml`), so a sub-threshold
+  tag can no longer publish.
+
 ## [1.6.0] - 2026-06-14
 
 ### Added
@@ -195,7 +212,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/BabelQueue/php-sdk/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/BabelQueue/php-sdk/compare/v1.3.0...v1.4.0
