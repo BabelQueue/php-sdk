@@ -5,16 +5,16 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\InboundMessage;
+use BabelQueue\Contracts\ConsumedMessage;
 
 /**
  * A record received by {@see KafkaConsumer} — the framework-agnostic, read-only view of the decoded
- * envelope ({@see InboundMessage}) plus the §6-reconciled `attempts` counter. On Kafka the
+ * envelope ({@see ConsumedMessage}) plus the §6-reconciled `attempts` counter. On Kafka the
  * **`bq-attempts` record header is authoritative** (Kafka has no native delivery count), falling
  * back to the body's `attempts` only when the header is absent — so a handler can implement its own
  * retry / dead-letter (retry-topic) policy on a poison record.
  */
-final class KafkaMessage implements InboundMessage
+final class KafkaMessage implements ConsumedMessage
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled

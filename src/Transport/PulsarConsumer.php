@@ -22,9 +22,10 @@ use Throwable;
  * (Pulsar's redelivery count is 0-based, so no `-1`), exposed via {@see PulsarMessage::attempts()}
  * so a handler can apply its own retry / dead-letter policy on a poison message.
  *
- * URN dispatch, `on_unknown_urn` and DLQ routing are the caller's concern (a framework adapter or a
- * thin runner), exactly as on the produce side — the core stays minimal and routes on `bq-job`
- * via the body's `job` URN ({@see EnvelopeCodec::urn()}).
+ * URN dispatch, `on_unknown_urn` and DLQ routing can be handled by the framework-less
+ * {@see \BabelQueue\Consume\Dispatcher} runtime (or a framework adapter): it is callable, so
+ * `consume($dispatcher, $shouldStop)` routes on `bq-job` via the body's `job` URN
+ * ({@see EnvelopeCodec::urn()}) and dead-letters poison messages — the consumer stays minimal.
  */
 final class PulsarConsumer
 {

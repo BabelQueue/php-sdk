@@ -23,9 +23,10 @@ use Throwable;
  * `max` (the header overrides even when lower), unlike §5 Pulsar. The reconciled value is exposed
  * via {@see KafkaMessage::attempts()} so a handler can implement its own retry-topic / DLQ policy.
  *
- * URN dispatch, `on_unknown_urn` and the §6 retry-topic / DLQ machinery stay the caller's concern
- * (a framework adapter or a runner), keeping the core minimal — it routes on `bq-job` via the
- * body's `job` URN ({@see EnvelopeCodec::urn()}).
+ * URN dispatch, `on_unknown_urn` and DLQ routing can be handled by the framework-less
+ * {@see \BabelQueue\Consume\Dispatcher} runtime (or a framework adapter): it is callable, so
+ * `consume($dispatcher, $shouldStop)` routes on `bq-job` via the body's `job` URN
+ * ({@see EnvelopeCodec::urn()}). (The §6 retry-topic delay/backoff tier is a follow-up.)
  */
 final class KafkaConsumer
 {

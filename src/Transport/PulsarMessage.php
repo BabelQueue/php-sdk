@@ -5,15 +5,15 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\InboundMessage;
+use BabelQueue\Contracts\ConsumedMessage;
 
 /**
  * A message received by {@see PulsarConsumer} — the framework-agnostic, read-only view of the
- * decoded envelope ({@see InboundMessage}) plus the Pulsar message id needed to ack/redeliver it
+ * decoded envelope ({@see ConsumedMessage}) plus the Pulsar message id needed to ack/redeliver it
  * and the §5-reconciled `attempts` counter (`max(body.attempts, redeliveryCount)`), so a handler
  * can implement its own retry/dead-letter policy on poison messages.
  */
-final class PulsarMessage implements InboundMessage
+final class PulsarMessage implements ConsumedMessage
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled

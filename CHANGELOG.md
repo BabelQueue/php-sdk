@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.8.0] - 2026-06-14
+
+### Added
+- **Framework-less consume runtime** — `BabelQueue\Consume\Dispatcher` and
+  `BabelQueue\Consume\DeadLetterPublisher`, the missing glue that makes the core consumers
+  (`PulsarConsumer`, `KafkaConsumer`) usefully runnable without a framework. The `Dispatcher` is a
+  **URN → handler registry** that is itself **callable**, so it plugs straight into a consumer's
+  loop: `$consumer->consume($dispatcher, $shouldStop)`. It routes each decoded message to its
+  handler, applies the four `on_unknown_urn` strategies (`fail`/`delete`/`release`/`dead_letter`,
+  via the existing `Routing\UnknownUrnStrategy`), and — with `maxAttempts` + a publisher — caps a
+  poison message by **dead-lettering** it instead of redelivering forever, all through the consume
+  loop's ack-on-return / redeliver-on-throw contract. `DeadLetterPublisher` enriches the envelope
+  with the additive `dead_letter` block (`DeadLetter::annotate`, ADR-0009) and publishes it to
+  `<queue>.dlq` via any `Transport`. A new `Contracts\ConsumedMessage` (the read-only view +
+  `attempts()` + `envelope()`), now implemented by `PulsarMessage`/`KafkaMessage`, is the runtime's
+  input. This brings PHP framework-less consume to parity with the Python/Node runtimes' dispatch +
+  unknown-URN + DLQ. (The Kafka **retry-topic** delay/backoff tier — §6.4/§6.5 — is a follow-up; the
+  `maxAttempts` cap is effective on Pulsar today and on Kafka once retry topics are configured.) The
+  envelope is unchanged (`schema_version: 1`); purely additive. Ships as a MINOR.
+
 ## [1.7.0] - 2026-06-14
 
 ### Added
@@ -212,7 +232,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/BabelQueue/php-sdk/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/BabelQueue/php-sdk/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...v1.5.0
