@@ -37,7 +37,8 @@
         "php-amqplib/php-amqplib": "For the framework-less RabbitMQ transport (BabelQueue\\Transport\\AmqpTransport).",
         "predis/predis": "Pure-PHP Redis client for the framework-less Redis transport (BabelQueue\\Transport\\RedisTransport).",
         "aws/aws-sdk-php": "For the framework-less Amazon SQS transport (BabelQueue\\Transport\\SqsTransport).",
-        "stomp-php/stomp-php": "To produce to Apache ActiveMQ Artemis over STOMP (the \u00a77 PHP path) via StompTransport."
+        "stomp-php/stomp-php": "To produce to Apache ActiveMQ Artemis over STOMP (the \u00a77 PHP path) via StompTransport.",
+        "ext-rdkafka": "To produce to Apache Kafka (the \u00a76 PHP path) via KafkaTransport (the php-rdkafka PECL extension over librdkafka; opt-in, relaxes GR-7 for Kafka \u2014 ADR-0019)."
     },
     "autoload": {
         "psr-4": {

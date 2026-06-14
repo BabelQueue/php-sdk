@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.3.0] - 2026-06-14
+
+### Added
+- **Apache Kafka transport** — `BabelQueue\Transport\KafkaTransport`, a framework-less Kafka
+  producer ([§6 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-kafka), ADR-0019). The
+  record **value** is the canonical envelope, the record **timestamp** mirrors `meta.created_at`
+  (Unix ms), and the contract fields are mirrored onto `bq-` **record headers** (UTF-8 strings —
+  `bq-job`/`bq-trace-id`/`bq-message-id`/`bq-schema-version`/`bq-source-lang`/`bq-attempts`; note
+  **hyphens**, unlike the §7 Artemis `bq_` underscores). Decoupled from `ext-rdkafka` behind a
+  one-method `BabelQueue\Transport\KafkaProducer` seam — dependency-free and unit-testable with a
+  fake (wrap a real `RdKafka\Producer` in a one-line adapter calling `producev()`). **`ext-rdkafka`
+  is a Composer `suggest`, never a `require`: it is a C extension over `librdkafka`, so this is an
+  opt-in transport that deliberately relaxes the zero-heavy-dependencies rule for Kafka only
+  (ADR-0019) — every Kafka-free app keeps the pure-userland install.** A producer transport (PHP
+  consumes Kafka via a framework worker — a consumer is a follow-up). The envelope is unchanged
+  (`schema_version: 1`). Ships as a MINOR.
+
 ## [1.2.0] - 2026-06-14
 
 ### Added
