@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.6.0] - 2026-06-14
+
+### Added
+- **Apache Kafka consumer** — `BabelQueue\Transport\KafkaConsumer`, the framework-less **consume**
+  half for §6 over `ext-rdkafka` (the counterpart to `KafkaTransport`;
+  [§6](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-kafka), ADR-0019). Consume is
+  **process-then-commit** (at-least-once): the `consume(callable $handler, ?callable $shouldStop)`
+  loop polls a record, runs the handler, and **commits the offset only on success** — a thrown
+  handler leaves the record uncommitted (re-delivered on the next restart/rebalance). Per §6 the
+  **`attempts` counter is the `bq-attempts` record header (authoritative — Kafka has no native
+  delivery count), falling back to the body's `attempts`** when the header is absent; note this is
+  *not* a `max` (the header overrides even when lower), unlike §5 Pulsar. The reconciled value is
+  exposed via `KafkaMessage::attempts()` so a handler can implement its own retry-topic / DLQ
+  policy. Also exposes the `receive()` / `commit()` primitives. `KafkaMessage` is the read-only
+  `InboundMessage` view. Decoupled from `ext-rdkafka` behind a one-method
+  `BabelQueue\Transport\KafkaConsumerClient` seam — dependency-free and unit-testable with a fake
+  (the **GR-7 relaxation is the C extension, opt-in, ADR-0019**, same as the producer). URN dispatch
+  / `on_unknown_urn` / the §6 retry-topic machinery stay the caller's concern, keeping the core
+  minimal. Proven live with a **Java → PHP(ext-rdkafka)** round-trip over a real Redpanda. The
+  envelope is unchanged (`schema_version: 1`). Ships as a MINOR.
+
 ## [1.5.0] - 2026-06-14
 
 ### Added
@@ -174,7 +195,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/BabelQueue/php-sdk/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/BabelQueue/php-sdk/compare/v1.2.0...v1.3.0
