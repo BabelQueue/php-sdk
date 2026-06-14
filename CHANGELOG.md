@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.4.0] - 2026-06-14
+
+### Added
+- **Apache Pulsar transport** — `BabelQueue\Transport\PulsarTransport`, a framework-less Pulsar
+  producer over Pulsar's native **WebSocket API** ([§5 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-pulsar), ADR-0020). The
+  message **value** is the canonical envelope; the contract fields are mirrored onto `bq-` native
+  **message properties** (string→string, integers stringified —
+  `bq-job`/`bq-trace-id`/`bq-message-id`/`bq-schema-version`/`bq-source-lang`/`bq-attempts`; note
+  **hyphens**, as on Kafka/SQS, unlike the §7 Artemis `bq_` underscores). The BabelQueue queue maps
+  to `persistent://<tenant>/<namespace>/<queue>`; the native `publishTimestamp` is broker-set and
+  informational, so the body's `meta.created_at` stays authoritative (the adapter must not set the
+  frame's `eventTime`). **Unlike the §6 Kafka path (ADR-0019), GR-7 stays intact**: Pulsar's
+  WebSocket service is driven by a **pure-PHP** client (e.g. `textalk/websocket`) — no C extension —
+  so this is opt-in like the §7 Artemis STOMP path. Decoupled from the WebSocket library behind a
+  one-method `BabelQueue\Transport\PulsarWebSocketClient` seam — dependency-free and unit-testable
+  with a fake (the adapter derives the `ws://…/ws/v2/producer/…` endpoint, base64-encodes the
+  payload, attaches the properties, and checks the producer ack). `textalk/websocket` is a Composer
+  **suggest**. Proven live with a PHP(WebSocket)→native-client round-trip over a real Pulsar
+  standalone (the §5 `bq-` properties and the envelope body read back byte-identical). A producer
+  transport (PHP consumes Pulsar via a framework worker — a consumer is a follow-up). The envelope
+  is unchanged (`schema_version: 1`). Ships as a MINOR.
+
 ## [1.3.0] - 2026-06-14
 
 ### Added
@@ -130,7 +153,10 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/BabelQueue/php-sdk/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/BabelQueue/php-sdk/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/BabelQueue/php-sdk/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/BabelQueue/php-sdk/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/php-sdk/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/BabelQueue/php-sdk/compare/v0.2.0...v0.3.0

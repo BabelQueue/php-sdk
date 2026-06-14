@@ -38,7 +38,8 @@
         "predis/predis": "Pure-PHP Redis client for the framework-less Redis transport (BabelQueue\\Transport\\RedisTransport).",
         "aws/aws-sdk-php": "For the framework-less Amazon SQS transport (BabelQueue\\Transport\\SqsTransport).",
         "stomp-php/stomp-php": "To produce to Apache ActiveMQ Artemis over STOMP (the \u00a77 PHP path) via StompTransport.",
-        "ext-rdkafka": "To produce to Apache Kafka (the \u00a76 PHP path) via KafkaTransport (the php-rdkafka PECL extension over librdkafka; opt-in, relaxes GR-7 for Kafka \u2014 ADR-0019)."
+        "ext-rdkafka": "To produce to Apache Kafka (the \u00a76 PHP path) via KafkaTransport (the php-rdkafka PECL extension over librdkafka; opt-in, relaxes GR-7 for Kafka \u2014 ADR-0019).",
+        "textalk/websocket": "Pure-PHP WebSocket client to produce to Apache Pulsar (the \u00a75 PHP path) via PulsarTransport over Pulsar's WebSocket API (GR-7 intact \u2014 ADR-0020)."
     },
     "autoload": {
         "psr-4": {
