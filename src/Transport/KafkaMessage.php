@@ -13,14 +13,20 @@ use BabelQueue\Contracts\ConsumedMessage;
  * **`bq-attempts` record header is authoritative** (Kafka has no native delivery count), falling
  * back to the body's `attempts` only when the header is absent — so a handler can implement its own
  * retry / dead-letter (retry-topic) policy on a poison record.
+ *
+ * It also carries the raw §6 `bq-` record headers, which the §6.4/§6.5 retry-topic machinery
+ * ({@see KafkaRetryRouter}) reads to recover the **work topic** of a record already in the retry
+ * chain (`bq-original-topic`) so retries route back to the right work topic across hops.
  */
 final class KafkaMessage implements ConsumedMessage
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
+     * @param  array<string, string>  $headers  the raw §6 `bq-` record headers (UTF-8 strings)
      */
     public function __construct(
         private readonly array $envelope,
+        private readonly array $headers = [],
     ) {
     }
 
@@ -60,6 +66,25 @@ final class KafkaMessage implements ConsumedMessage
         $attempts = $this->envelope['attempts'] ?? 0;
 
         return is_int($attempts) ? $attempts : 0;
+    }
+
+    /**
+     * The raw §6 `bq-` record headers (UTF-8 strings).
+     *
+     * @return array<string, string>
+     */
+    public function headers(): array
+    {
+        return $this->headers;
+    }
+
+    /**
+     * A single raw §6 `bq-` record header, or null when absent — e.g. `bq-original-topic` on a
+     * record already in the retry chain.
+     */
+    public function header(string $name): ?string
+    {
+        return $this->headers[$name] ?? null;
     }
 
     /**

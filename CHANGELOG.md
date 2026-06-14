@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.9.0] - 2026-06-14
+
+### Added
+- **Apache Kafka retry-topic machinery (§6.4/§6.5)** — `BabelQueue\Transport\KafkaRetryRouter` and
+  `BabelQueue\Transport\KafkaRetryConsumer`, the SDK-owned **retry / DLQ** pattern Kafka can't give
+  natively (no delayed delivery, no retry queue, no dead-letter queue), completing reliable Kafka
+  consume for PHP. On a work-topic handler **failure**, `KafkaRetryRouter::route($message, $e)`
+  republishes the envelope to the next **tiered delay topic** `<workTopic>.retry.<delayMs>` (default
+  tiers **5s / 30s / 5m / 30m**) with `bq-attempts` incremented (and the body's top-level `attempts`
+  kept in sync), stamping the `bq-delay` (tier ms) and `bq-original-topic` (work topic) re-injection
+  headers; once attempts are exhausted (`next >= maxAttempts`) it dead-letters to `<workTopic>.dlq`
+  with the additive `dead_letter` block (`DeadLetter::annotate`, ADR-0009) instead. The caller then
+  returns so the original record commits (process-then-commit, §6). A separate process runs
+  `KafkaRetryConsumer::consume()` over the retry topics: it reads each `<workTopic>.retry.<delayMs>`
+  record, **waits the tier delay cooperatively** (there is no broker timer — it heartbeats the
+  consumer via a keep-alive `poll(0)` so a wait longer than `max.poll.interval.ms` does not evict it
+  from its group, rather than one blocking sleep), then **re-injects** the record into its
+  `bq-original-topic` and commits. Attempts are **not** re-incremented on re-injection (the
+  work-topic handler counts the attempt). `bq-trace-id` is preserved byte-for-byte across every
+  retry hop (GR-4). The re-injection consumer takes a new one-method
+  `BabelQueue\Transport\KafkaRetryConsumerClient` seam (`receive()` / `poll()` keep-alive /
+  `commit()`) — a separate seam from `KafkaConsumerClient` so its existing adapter is untouched — and
+  the wait is driven by injectable `$now`/`$sleep` seams, so both classes stay dependency-free behind
+  the seams and unit-test against fakes with no real time. `KafkaMessage` now additively surfaces the
+  raw `bq-` record headers (`header()` / `headers()`) so the router can route a retry record back to
+  its work topic across hops. This makes the `Consume\Dispatcher` `maxAttempts` dead-letter cap
+  **effective on Kafka** (since `bq-attempts` now grows across retry hops, not just on Pulsar's native
+  redelivery count). Proven live with a **retry → re-inject → success** cycle and a
+  **poison → exhaust → DLQ** path over a real Redpanda via `ext-rdkafka`. The envelope is unchanged
+  (`schema_version: 1`); purely additive. Ships as a MINOR.
+
 ## [1.8.0] - 2026-06-14
 
 ### Added
@@ -232,7 +263,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/BabelQueue/php-sdk/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/BabelQueue/php-sdk/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/BabelQueue/php-sdk/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...v1.6.0

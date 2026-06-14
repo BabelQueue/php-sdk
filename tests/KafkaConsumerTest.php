@@ -78,6 +78,23 @@ final class KafkaConsumerTest extends TestCase
         $this->assertNull((new KafkaConsumer($client))->receive());
     }
 
+    public function test_receive_surfaces_the_raw_bq_headers_for_the_retry_machinery(): void
+    {
+        // The §6.4/§6.5 retry-topic machinery reads bq-original-topic off the message to route a
+        // retry record back to its work topic across hops.
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            $this->raw(['bq-attempts' => '2', 'bq-original-topic' => 'orders']),
+        );
+
+        $message = (new KafkaConsumer($client))->receive();
+
+        $this->assertInstanceOf(KafkaMessage::class, $message);
+        $this->assertSame('orders', $message->header('bq-original-topic'));
+        $this->assertSame('2', $message->headers()['bq-attempts']);
+        $this->assertNull($message->header('bq-missing'));
+    }
+
     public function test_consume_commits_after_a_successful_handler(): void
     {
         $client = Mockery::mock(KafkaConsumerClient::class);

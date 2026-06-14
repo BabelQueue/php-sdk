@@ -26,7 +26,9 @@ use Throwable;
  * URN dispatch, `on_unknown_urn` and DLQ routing can be handled by the framework-less
  * {@see \BabelQueue\Consume\Dispatcher} runtime (or a framework adapter): it is callable, so
  * `consume($dispatcher, $shouldStop)` routes on `bq-job` via the body's `job` URN
- * ({@see EnvelopeCodec::urn()}). (The §6 retry-topic delay/backoff tier is a follow-up.)
+ * ({@see EnvelopeCodec::urn()}). The §6.4/§6.5 retry-topic delay/backoff + DLQ tier is the
+ * {@see KafkaRetryRouter} (route a failure to `<topic>.retry.<delayMs>` / `<topic>.dlq`) plus the
+ * {@see KafkaRetryConsumer} (wait the tier delay, re-inject into the work topic).
  */
 final class KafkaConsumer
 {
@@ -57,7 +59,9 @@ final class KafkaConsumer
             $envelope['attempts'] = (int) $header;
         }
 
-        return new KafkaMessage($envelope);
+        // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
+        // record's original work topic (bq-original-topic) across hops.
+        return new KafkaMessage($envelope, $raw['headers']);
     }
 
     /**
