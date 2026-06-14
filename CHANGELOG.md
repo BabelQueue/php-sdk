@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [1.5.0] - 2026-06-14
+
+### Added
+- **Apache Pulsar consumer** — `BabelQueue\Transport\PulsarConsumer`, the framework-less **consume**
+  half for §5 over Pulsar's native **WebSocket consumer API** (the counterpart to `PulsarTransport`;
+  [§5.5](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-pulsar), ADR-0020). It is the
+  first consume surface on the otherwise publish-only core. It exposes the §5.5 primitives —
+  `receive()` (decode + reconcile attempts), `acknowledge()` (delete) and `release()`
+  (`negativeAcknowledge` → redelivery, at-least-once) — plus a `consume(callable $handler, ?callable
+  $shouldStop)` loop that acks on success and releases when the handler throws. Per §5.5 it
+  **reconciles `attempts = max(body.attempts, redeliveryCount)`** (Pulsar's redelivery count is
+  0-based, so no `-1`), exposed via `PulsarMessage::attempts()` so a handler owns its retry /
+  dead-letter policy on a poison message. `PulsarMessage` is the read-only `InboundMessage` view
+  (URN/trace/data/meta) plus the ack handle. Decoupled from the WebSocket library behind a
+  one-method `BabelQueue\Transport\PulsarWebSocketConsumerClient` seam — dependency-free and
+  unit-testable with a fake; **GR-7 stays intact** (pure-PHP WebSocket, no C extension, like the
+  producer). URN dispatch / `on_unknown_urn` / DLQ stay the caller's concern (a framework adapter or
+  runner), keeping the core minimal. Proven live with a **Java(native) → PHP(WebSocket)** round-trip
+  over a real Pulsar standalone. `textalk/websocket` is a Composer **suggest**. The envelope is
+  unchanged (`schema_version: 1`). Ships as a MINOR.
+
 ## [1.4.0] - 2026-06-14
 
 ### Added
@@ -153,7 +174,8 @@ contract live at [babelqueue.com](https://babelqueue.com).
 - Framework-agnostic core. Requires PHP `^8.2` and `ext-json` only — no heavy deps.
 - Framework adapters (`babelqueue/laravel`, `babelqueue/symfony`) build on this.
 
-[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/php-sdk/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/BabelQueue/php-sdk/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/BabelQueue/php-sdk/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/BabelQueue/php-sdk/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/BabelQueue/php-sdk/compare/v1.1.0...v1.2.0
