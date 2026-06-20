@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\Transport;
+use BabelQueue\Contracts\HeaderPublisher;
+use BabelQueue\Support\Headers;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
@@ -24,9 +25,15 @@ use PhpAmqpLib\Wire\AMQPTable;
  * Publishing goes to the default exchange with the queue name as the routing key
  * (the AMQP equivalent of "push onto this queue").
  *
+ * **Out-of-band headers (ADR-0028).** It also implements the optional {@see HeaderPublisher}
+ * capability: {@see self::publishWithHeaders()} carries out-of-band transport headers (e.g. a W3C
+ * `traceparent` for cross-hop span linkage) in the AMQP **message headers** (`application_headers`),
+ * merged **beside** the contract `x-*` headers — the contract wins a key collision (GR-1: the wire
+ * envelope itself is untouched). A plain {@see self::publish()} stays byte-identical to before.
+ *
  * Optional dependency: `php-amqplib/php-amqplib`.
  */
-final class AmqpTransport implements Transport
+final class AmqpTransport implements HeaderPublisher
 {
     public function __construct(
         private readonly AMQPChannel $channel,
@@ -36,12 +43,32 @@ final class AmqpTransport implements Transport
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
+        return $this->send($payload, $queue, []);
+    }
+
+    /**
+     * Publish the envelope together with out-of-band `$headers` ({@see HeaderPublisher}, ADR-0028).
+     * The headers ride in the AMQP message headers beside the contract `x-*` headers, which win a
+     * key collision. An empty/blank map degrades to a plain {@see self::publish()}.
+     *
+     * @param  array<string, string>  $headers
+     */
+    public function publishWithHeaders(string $payload, array $headers, ?string $queue = null): ?string
+    {
+        return $this->send($payload, $queue, $headers);
+    }
+
+    /**
+     * @param  array<string, string>  $extraHeaders  out-of-band headers to carry beside the contract `x-*`
+     */
+    private function send(string $payload, ?string $queue, array $extraHeaders): ?string
+    {
         $target = $queue ?? $this->defaultQueue;
         $envelope = EnvelopeCodec::decode($payload);
 
         // passive=false, durable=true, exclusive=false, auto_delete=false.
         $this->channel->queue_declare($target, false, true, false, false);
-        $this->channel->basic_publish($this->toMessage($payload, $envelope), '', $target);
+        $this->channel->basic_publish($this->toMessage($payload, $envelope, $extraHeaders), '', $target);
 
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
         $id = $meta['id'] ?? null;
@@ -51,8 +78,9 @@ final class AmqpTransport implements Transport
 
     /**
      * @param  array<string, mixed>  $envelope
+     * @param  array<string, string>  $extraHeaders
      */
-    private function toMessage(string $payload, array $envelope): AMQPMessage
+    private function toMessage(string $payload, array $envelope, array $extraHeaders): AMQPMessage
     {
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
 
@@ -77,11 +105,20 @@ final class AmqpTransport implements Transport
             $properties['message_id'] = (string) $meta['id'];
         }
 
-        $headers = array_filter([
+        $contract = array_filter([
             'x-schema-version' => $meta['schema_version'] ?? null,
             'x-source-lang' => $meta['lang'] ?? null,
             'x-attempts' => $envelope['attempts'] ?? null,
         ], static fn ($value): bool => $value !== null);
+
+        // Out-of-band riders go in first; the contract x-* headers overwrite them last so they win
+        // a key collision (merge-not-clobber, shared across every SDK) — and keep their native
+        // value types, so a plain publish (no extra headers) is byte-identical to before. GR-1: the
+        // wire envelope body is never touched.
+        $headers = Headers::sanitize($extraHeaders);
+        foreach ($contract as $key => $value) {
+            $headers[$key] = $value;
+        }
 
         if ($headers !== []) {
             $properties['application_headers'] = new AMQPTable($headers);

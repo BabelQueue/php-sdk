@@ -69,4 +69,59 @@ final class AmqpTransportTest extends TestCase
 
         (new AmqpTransport($channel))->publish(self::ENVELOPE);
     }
+
+    public function test_publish_with_headers_carries_traceparent_beside_the_contract_headers(): void
+    {
+        $captured = $this->captureWithHeaders('orders', [
+            'traceparent' => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+            'tracestate' => 'rojo=00f067aa0ba902b7',
+        ]);
+
+        // The body is untouched (GR-1) — only the AMQP message headers carry the rider.
+        $this->assertSame(self::ENVELOPE, $captured->getBody());
+
+        $headers = $captured->get('application_headers')->getNativeData();
+        $this->assertSame('00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01', $headers['traceparent']);
+        $this->assertSame('rojo=00f067aa0ba902b7', $headers['tracestate']);
+        // The contract x-* headers still ride, with their native value types.
+        $this->assertSame(1, $headers['x-schema-version']);
+        $this->assertSame('php', $headers['x-source-lang']);
+        $this->assertSame(0, $headers['x-attempts']);
+    }
+
+    public function test_publish_with_headers_lets_the_contract_win_a_key_collision(): void
+    {
+        // A rider trying to overwrite a contract header must not clobber it.
+        $captured = $this->captureWithHeaders('orders', ['x-source-lang' => 'go', 'traceparent' => '00-abc']);
+
+        $headers = $captured->get('application_headers')->getNativeData();
+        $this->assertSame('php', $headers['x-source-lang']); // contract wins
+        $this->assertSame('00-abc', $headers['traceparent']);
+    }
+
+    /**
+     * @param  array<string, string>  $headers
+     */
+    private function captureWithHeaders(string $queue, array $headers): AMQPMessage
+    {
+        $captured = null;
+
+        $channel = Mockery::mock(AMQPChannel::class);
+        $channel->shouldReceive('queue_declare')->once()->with($queue, false, true, false, false);
+        $channel->shouldReceive('basic_publish')->once()->with(
+            Mockery::on(function (AMQPMessage $message) use (&$captured): bool {
+                $captured = $message;
+
+                return true;
+            }),
+            '',
+            $queue,
+        );
+
+        (new AmqpTransport($channel, 'default'))->publishWithHeaders(self::ENVELOPE, $headers, $queue);
+
+        $this->assertInstanceOf(AMQPMessage::class, $captured);
+
+        return $captured;
+    }
 }

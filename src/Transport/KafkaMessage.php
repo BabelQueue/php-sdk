@@ -6,6 +6,7 @@ namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
+use BabelQueue\Contracts\HasHeaders;
 
 /**
  * A record received by {@see KafkaConsumer} — the framework-agnostic, read-only view of the decoded
@@ -16,9 +17,12 @@ use BabelQueue\Contracts\ConsumedMessage;
  *
  * It also carries the raw §6 `bq-` record headers, which the §6.4/§6.5 retry-topic machinery
  * ({@see KafkaRetryRouter}) reads to recover the **work topic** of a record already in the retry
- * chain (`bq-original-topic`) so retries route back to the right work topic across hops.
+ * chain (`bq-original-topic`) so retries route back to the right work topic across hops. Because it
+ * surfaces those record headers via {@see HasHeaders}, it is the consume-side hook through which a
+ * carried W3C `traceparent` would reach {@see \BabelQueue\Otel\Tracing::wrap()} once a Kafka
+ * producer injects one (ADR-0028; the Kafka producer-side wiring is a documented follow-up).
  */
-final class KafkaMessage implements ConsumedMessage
+final class KafkaMessage implements ConsumedMessage, HasHeaders
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled

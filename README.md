@@ -33,6 +33,8 @@ composer require babelqueue/php-sdk
 | Transports | `BabelQueue\Transport\RedisTransport` / `AmqpTransport` | Optional framework-less reference `Transport` impls (Redis `RPUSH`; RabbitMQ durable + contract AMQP properties). |
 | Dead-letter | `BabelQueue\DeadLetter\DeadLetter` | Annotate an envelope with the additive `dead_letter` block (ADR-0009). |
 | Outbox | `BabelQueue\Outbox\Outbox` / `OutboxRelay` / `OutboxStore` | Transactional outbox (ADR-0029): persist the message **atomically with the business write**, relay it later. Dependency-free — `OutboxStore` is an interface you bind to your DB. |
+| Tracing | `BabelQueue\Otel\Tracing` | Optional OpenTelemetry produce/consume spans (ADR-0025/0028): correlate across hops via `trace_id`, and — when the transport carries headers — link spans across hops via a W3C `traceparent`. Opt-in; `open-telemetry/api` is a `suggest`. |
+| Headers | `BabelQueue\Contracts\HeaderPublisher` / `HasHeaders` | The out-of-band transport-header seam (ADR-0027/0028): publish headers **beside** the frozen envelope, and surface them on a consumed message. |
 | Routing | `BabelQueue\Routing\UnknownUrnStrategy` | `fail` / `delete` / `release` / `dead_letter` constants. |
 | Support | `BabelQueue\Support\Uuid` | Dependency-free UUIDv4 (no ramsey/symfony-uid needed). |
 | Errors | `BabelQueue\Exceptions\BabelQueueException` / `UnknownUrnException` / `InvalidEnvelopeException` | Exception hierarchy; `InvalidEnvelopeException` carries the rejection reason + envelope. |
@@ -109,6 +111,49 @@ $relay->drain();                              // publishes verbatim, marks publi
 **InitORM-backed** adapter + the outbox-table DDL live in
 [`babelqueue-examples/outbox-initorm/`](https://github.com/BabelQueue/babelqueue-examples/tree/main/outbox-initorm),
 keeping this core DB-free.
+
+## OpenTelemetry tracing (ADR-0025 / ADR-0028)
+
+`BabelQueue\Otel\Tracing` adds **optional** OpenTelemetry spans to a producer or consumer. It is
+opt-in and dependency-light — `open-telemetry/api` is only a `suggest`, so the core stays
+`ext-json` (GR-7). Cross-hop trace propagation layers two levels:
+
+- **`trace_id` ↔ TraceId** (v0.1): the envelope's `trace_id` maps 1:1 to an OTel trace id, so every
+  hop that shares a `trace_id` shares one trace — correlation + per-hop timing with **zero**
+  wire/transport change. Preserved end-to-end (GR-4).
+- **W3C `traceparent`** (v0.2): the producer also injects the active span context as a `traceparent`
+  **transport header** — beside the frozen envelope, never in it (GR-1) — so the consumer starts its
+  span as a true **child** of the producer span (real cross-hop parent-child linkage). With no
+  `traceparent` present it falls back to the v0.1 behaviour — a strict, backward-compatible upgrade.
+
+```bash
+composer require open-telemetry/api          # + open-telemetry/sdk to export
+```
+
+```php
+use BabelQueue\Otel\Tracing;
+
+// Produce — a PRODUCER span "publish <urn>"; the active span's traceparent rides the transport
+// header when the transport carries headers (AMQP/SQS/Redis below), else it degrades to a plain
+// publish with the trace_id still stamped (no error).
+Tracing::publish($tracer, $transport, 'urn:babel:orders:created', ['order_id' => 1042], 'orders');
+
+// Consume — a CONSUMER span "process <urn>", started as a child of the producer span when the
+// delivered message surfaces a traceparent (HasHeaders); else from the trace_id (v0.1).
+$dispatch->on('urn:babel:orders:created', Tracing::wrap($tracer, fn ($m) => handle($m)));
+```
+
+The `traceparent` rides the out-of-band `HeaderPublisher` / `HasHeaders` seam (the same seam as the
+replay-bypass marker, ADR-0027). Which reference transports carry it:
+
+| Transport | Carries `traceparent` | Carrier |
+| :--- | :--- | :--- |
+| `RedisTransport` | **Yes** | A transport-owned `__bq_frame` JSON frame wrapping the bare envelope (Redis has no native per-message metadata channel). A header-less publish stays byte-for-byte bare; `unframe()` is back-compatible with bare/cross-version values. |
+| `AmqpTransport` | **Yes** | AMQP message headers, beside the contract `x-*` headers (contract wins a collision). |
+| `SqsTransport` | **Yes** | SQS `MessageAttributes` (String), beside the contract `bq-*` attributes (contract wins; bounded by the 10-attribute SQS cap). |
+| `KafkaTransport` / `PulsarTransport` / `StompTransport` | Deferred | These producers already project rich `bq-*`/`bq_*` headers; wiring `traceparent` through their retry-topic / annotation machinery is a documented follow-up. Until then they degrade to v0.1 `trace_id` correlation (no error). `KafkaMessage` already surfaces its record headers via `HasHeaders`, the consume-side hook a future Kafka producer would reach. |
+
+A plain `publish()` (no tracer) is unchanged on every transport.
 
 ## Design
 

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**).
 
+## [Unreleased]
+
+## [1.14.0] - 2026-06-21
+
+### Added
+- **OpenTelemetry v0.2 — W3C `traceparent` transport-header propagation (ADR-0028, implements
+  ADR-0025 Option 2).** `BabelQueue\Otel\Tracing` now layers **true cross-hop span parent-child
+  linkage** on top of the v0.1 `trace_id` correlation: on **produce** it injects the active span
+  context as a W3C `traceparent` (and `tracestate`) onto the outgoing **transport headers** — beside
+  the frozen envelope, never in it (GR-1) — via the new optional `BabelQueue\Contracts\HeaderPublisher`
+  capability; on **consume** `Tracing::wrap()` reads a delivered message's headers (when it implements
+  the new `BabelQueue\Contracts\HasHeaders` seam) and starts the `process <urn>` CONSUMER span as a
+  true **child** of the producer span. **With no `traceparent` it falls back to the v0.1
+  `trace_id`-derived parent** — a strict, backward-compatible upgrade (no regression). The W3C
+  inject/extract uses OTel's own `TraceContextPropagator`, which lives in `open-telemetry/api` — still
+  a `suggest`, so the core stays `ext-json` (GR-7); `trace_id` is preserved end-to-end (GR-4) and
+  `schema_version` stays **1**.
+- **Out-of-band transport-header seam (dependency-free core):** `BabelQueue\Contracts\HeaderPublisher`
+  (optional `Transport` capability — `publishWithHeaders()`), `BabelQueue\Contracts\HasHeaders`
+  (consume-side — surface a delivered message's headers), and the pure `BabelQueue\Support\Headers`
+  helper (`sanitize()` / `merge()`, the shared merge-not-clobber idiom). This is the same out-of-band
+  seam the replay-bypass marker uses (ADR-0027); `traceparent` is the second rider.
+- **Reference transports now carry `traceparent`:**
+  - `RedisTransport` implements `HeaderPublisher` via a transport-owned `__bq_frame` JSON frame that
+    wraps the bare wire envelope (Redis has no native per-message metadata channel — the LREM ack
+    handle *is* the stored value). Opt-in and backward compatible: a plain `publish()` (and
+    `publishWithHeaders()` with no usable headers) stores the **bare** envelope byte-for-byte; the new
+    `RedisTransport::unframe()` detects frame-vs-bare by the reserved `__bq_frame` sentinel (a frozen
+    envelope never has it), so bare/cross-version queue values consume exactly as before.
+  - `AmqpTransport` implements `HeaderPublisher`, merging the header into the AMQP message headers
+    beside the contract `x-*` headers (contract wins a key collision).
+  - `SqsTransport` implements `HeaderPublisher`, merging the header into the SQS `MessageAttributes`
+    beside the contract `bq-*` attributes (contract wins; bounded by the 10-attribute SQS cap).
+  - `KafkaMessage` now implements `HasHeaders` (surfacing its `bq-*` record headers), the consume-side
+    hook a future Kafka producer-side `traceparent` would reach. Kafka/Pulsar/STOMP **producer-side**
+    wiring is a documented follow-up; until then they degrade to v0.1 `trace_id` correlation (no error).
+
+  A plain `publish()` stays byte-identical on every transport. Purely additive (the envelope is
+  unchanged, `schema_version: 1`); ships as a MINOR.
+
 ## [1.9.0] - 2026-06-14
 
 ### Added

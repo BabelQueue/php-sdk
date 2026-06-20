@@ -112,4 +112,77 @@ final class SqsTransportTest extends TestCase
         $this->assertSame('grp', $captured['MessageGroupId']);
         $this->assertArrayNotHasKey('MessageDeduplicationId', $captured);
     }
+
+    public function test_publish_with_headers_carries_traceparent_beside_the_contract_attributes(): void
+    {
+        $captured = $this->captureWithHeaders([
+            'traceparent' => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+        ]);
+
+        // Body unchanged (GR-1); the rider rides as an extra String MessageAttribute.
+        $this->assertSame(self::ENVELOPE, $captured['MessageBody']);
+        $attrs = $captured['MessageAttributes'];
+        $this->assertSame(
+            ['DataType' => 'String', 'StringValue' => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'],
+            $attrs['traceparent'],
+        );
+        // The contract bq-* attributes are untouched.
+        $this->assertSame(['DataType' => 'String', 'StringValue' => 'trace-1'], $attrs['bq-trace-id']);
+        $this->assertSame(['DataType' => 'String', 'StringValue' => 'urn:babel:orders:created'], $attrs['bq-job']);
+    }
+
+    public function test_publish_with_headers_never_clobbers_a_contract_attribute(): void
+    {
+        // A rider keyed bq-trace-id must not overwrite the contract attribute.
+        $captured = $this->captureWithHeaders(['bq-trace-id' => 'rider-should-lose', 'traceparent' => '00-abc']);
+
+        $attrs = $captured['MessageAttributes'];
+        $this->assertSame(['DataType' => 'String', 'StringValue' => 'trace-1'], $attrs['bq-trace-id']); // contract wins
+        $this->assertSame(['DataType' => 'String', 'StringValue' => '00-abc'], $attrs['traceparent']);
+    }
+
+    public function test_publish_with_headers_respects_the_ten_attribute_cap(): void
+    {
+        // The envelope already projects 6 contract attributes; only 4 rider slots remain (cap 10).
+        $riders = [];
+        for ($i = 1; $i <= 8; $i++) {
+            $riders["rider-$i"] = "v$i";
+        }
+
+        $captured = $this->captureWithHeaders($riders);
+        $attrs = $captured['MessageAttributes'];
+
+        $this->assertCount(10, $attrs);
+        // All 6 contract attributes survive (they are seeded first and never dropped).
+        foreach (['bq-job', 'bq-trace-id', 'bq-message-id', 'bq-schema-version', 'bq-source-lang', 'bq-created-at'] as $key) {
+            $this->assertArrayHasKey($key, $attrs);
+        }
+        // Exactly 4 riders fit into the remaining headroom.
+        $riderKeys = array_filter(array_keys($attrs), static fn (string $k): bool => str_starts_with($k, 'rider-'));
+        $this->assertCount(4, $riderKeys);
+    }
+
+    /**
+     * @param  array<string, string>  $headers
+     * @return array<string, mixed>
+     */
+    private function captureWithHeaders(array $headers): array
+    {
+        $captured = null;
+
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldReceive('sendMessage')->once()->with(
+            Mockery::on(function (array $args) use (&$captured): bool {
+                $captured = $args;
+
+                return true;
+            }),
+        );
+
+        (new SqsTransport($client, self::URL))->publishWithHeaders(self::ENVELOPE, $headers);
+
+        $this->assertIsArray($captured);
+
+        return $captured;
+    }
 }

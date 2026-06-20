@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\Transport;
+use BabelQueue\Contracts\HeaderPublisher;
+use BabelQueue\Support\Headers;
 
 /**
  * A framework-less Amazon SQS producer: sends the canonical envelope as the message
@@ -21,6 +22,14 @@ use BabelQueue\Contracts\Transport;
  * Implements §3 of the broker-bindings contract. The envelope is unchanged
  * (`schema_version` stays 1); SQS is purely additive.
  *
+ * **Out-of-band headers (ADR-0028).** It also implements the optional {@see HeaderPublisher}
+ * capability: {@see self::publishWithHeaders()} carries out-of-band transport headers (e.g. a W3C
+ * `traceparent` for cross-hop span linkage) as additional String `MessageAttributes`, merged
+ * **beside** the contract `bq-*` attributes where `bq-trace-id` already rides — the contract wins a
+ * key collision, and the merged set is bounded by SQS's **10-attribute limit** (contract attributes
+ * are seeded first, so a rider is only added while headroom remains). A plain {@see self::publish()}
+ * stays byte-identical to before. GR-1: the wire envelope body is never touched.
+ *
  * Optional dependency: `aws/aws-sdk-php`. Wrap your client in one line:
  *
  * ```php
@@ -34,8 +43,11 @@ use BabelQueue\Contracts\Transport;
  * );
  * ```
  */
-final class SqsTransport implements Transport
+final class SqsTransport implements HeaderPublisher
 {
+    /** SQS allows at most 10 message attributes per message. */
+    private const MAX_ATTRIBUTES = 10;
+
     public function __construct(
         private readonly SqsClient $client,
         private readonly string $queueUrl,
@@ -47,6 +59,28 @@ final class SqsTransport implements Transport
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
+        return $this->send($payload, $queue, []);
+    }
+
+    /**
+     * Publish the envelope together with out-of-band `$headers` ({@see HeaderPublisher}, ADR-0028).
+     * The headers ride as additional String `MessageAttributes` beside the contract `bq-*`
+     * attributes, which win a key collision; the merged set is capped at SQS's 10-attribute limit
+     * (the contract attributes are kept; riders fill any remaining slots). An empty/blank map
+     * degrades to a plain {@see self::publish()}.
+     *
+     * @param  array<string, string>  $headers
+     */
+    public function publishWithHeaders(string $payload, array $headers, ?string $queue = null): ?string
+    {
+        return $this->send($payload, $queue, $headers);
+    }
+
+    /**
+     * @param  array<string, string>  $extraHeaders  out-of-band headers to carry beside the contract `bq-*`
+     */
+    private function send(string $payload, ?string $queue, array $extraHeaders): ?string
+    {
         $url = $queue ?? $this->queueUrl;
         $envelope = EnvelopeCodec::decode($payload);
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
@@ -54,7 +88,7 @@ final class SqsTransport implements Transport
         $args = [
             'QueueUrl' => $url,
             'MessageBody' => $payload,
-            'MessageAttributes' => $this->attributes($envelope, $meta),
+            'MessageAttributes' => $this->attributes($envelope, $meta, $extraHeaders),
         ];
 
         if ($this->fifo) {
@@ -74,9 +108,10 @@ final class SqsTransport implements Transport
     /**
      * @param  array<string, mixed>  $envelope
      * @param  array<string, mixed>  $meta
+     * @param  array<string, string>  $extraHeaders
      * @return array<string, array{DataType: string, StringValue: string}>
      */
-    private function attributes(array $envelope, array $meta): array
+    private function attributes(array $envelope, array $meta, array $extraHeaders): array
     {
         $attributes = [];
 
@@ -101,6 +136,19 @@ final class SqsTransport implements Transport
         }
         if (isset($meta['created_at']) && is_scalar($meta['created_at'])) {
             $attributes['bq-created-at'] = self::number((string) $meta['created_at']);
+        }
+
+        // Fold in the out-of-band riders, but never clobber a contract attribute and never exceed
+        // the 10-attribute SQS cap (contract attributes are seeded above, so they always win and a
+        // rider only lands while headroom remains).
+        foreach (Headers::sanitize($extraHeaders) as $name => $value) {
+            if (isset($attributes[$name])) {
+                continue;
+            }
+            if (count($attributes) >= self::MAX_ATTRIBUTES) {
+                break;
+            }
+            $attributes[$name] = self::string($value);
         }
 
         return $attributes;
