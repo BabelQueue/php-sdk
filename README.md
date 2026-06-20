@@ -32,6 +32,7 @@ composer require babelqueue/php-sdk
 | Validation | `BabelQueue\Validation\EnvelopeValidator` | Consumer-side validation **with a reason** — quarantine an unsupported `meta.schema_version` instead of dropping it. |
 | Transports | `BabelQueue\Transport\RedisTransport` / `AmqpTransport` | Optional framework-less reference `Transport` impls (Redis `RPUSH`; RabbitMQ durable + contract AMQP properties). |
 | Dead-letter | `BabelQueue\DeadLetter\DeadLetter` | Annotate an envelope with the additive `dead_letter` block (ADR-0009). |
+| Outbox | `BabelQueue\Outbox\Outbox` / `OutboxRelay` / `OutboxStore` | Transactional outbox (ADR-0029): persist the message **atomically with the business write**, relay it later. Dependency-free — `OutboxStore` is an interface you bind to your DB. |
 | Routing | `BabelQueue\Routing\UnknownUrnStrategy` | `fail` / `delete` / `release` / `dead_letter` constants. |
 | Support | `BabelQueue\Support\Uuid` | Dependency-free UUIDv4 (no ramsey/symfony-uid needed). |
 | Errors | `BabelQueue\Exceptions\BabelQueueException` / `UnknownUrnException` / `InvalidEnvelopeException` | Exception hierarchy; `InvalidEnvelopeException` carries the rejection reason + envelope. |
@@ -71,6 +72,43 @@ if ($reason = EnvelopeValidator::check($envelope)) {
 
 phpredis (`ext-redis`) users can implement the one-method `Transport` directly —
 it is just an `rpush`.
+
+## Transactional outbox (ADR-0029)
+
+A plain producer makes a **dual write** — commit the business row *and* publish to the
+broker — two systems that can disagree on a crash. The outbox removes it: the message is
+written into the **same database, in the same transaction** as the business data (so they
+commit or roll back atomically), and a separate **relay** publishes it afterwards. No
+distributed transaction; exactly-once *handoff* into the broker (then at-least-once on the
+wire, deduped on `meta.id` by the consumer-side `Idempotent::wrap`, ADR-0022).
+
+The helper is dependency-free (GR-7): the core defines `OutboxStore` and you bind it to
+your DB. **The transaction boundary is yours** — `OutboxStore::save()` runs inside the
+transaction *you* opened around your business write. The envelope is stored **verbatim**
+(GR-1) and relayed byte-for-byte, so `trace_id` is preserved end-to-end (GR-4).
+
+```php
+use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\Outbox\Outbox;
+use BabelQueue\Outbox\OutboxRelay;
+
+// WRITE side — one transaction for the business row AND the message (your tx boundary).
+$outbox = new Outbox($store);                 // $store implements OutboxStore (your DB)
+$db->transaction(function () use ($db, $outbox, $order): void {
+    $db->insertOrder($order);                                          // business write
+    $outbox->write(EnvelopeCodec::make('urn:babel:orders:created', $order, 'orders'));
+});                                            // both commit, or neither
+
+// READ side — a worker/cron drains the durable rows onto the broker.
+$relay = new OutboxRelay($transport, $store); // $transport is any BabelQueue Transport
+$relay->drain();                              // publishes verbatim, marks published/failed
+```
+
+`OutboxStore` is four methods — `save()`, `fetchUnpublished()`, `markPublished()`,
+`markFailed()`. A reference `InMemoryOutboxStore` ships for tests; a runnable
+**InitORM-backed** adapter + the outbox-table DDL live in
+[`babelqueue-examples/outbox-initorm/`](https://github.com/BabelQueue/babelqueue-examples/tree/main/outbox-initorm),
+keeping this core DB-free.
 
 ## Design
 
