@@ -9,6 +9,34 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-06-21
+
+### Added
+- **Runtime GDPR field encryption (ADR-0030).** Opt-in, standalone helpers that encrypt the `data`
+  fields a registry declared `x-gdpr-sensitive` before publish and decrypt them after decode —
+  matching the Go reference. The envelope stays **frozen** (GR-1): only a sensitive leaf's *value*
+  changes, becoming a ciphertext **string**, so `data` stays pure JSON (GR-3), `schema_version`
+  stays **1**, and `trace_id` is untouched (GR-4). An SDK without the key still carries the
+  envelope (it just can't read the protected fields).
+  - `BabelQueue\Gdpr\Cipher` — the caller-provided encryption seam (`encrypt()` / `decrypt()`),
+    bound to a KMS / Vault / HSM / tokenisation service. Keeping it an interface holds GR-7: the
+    core pulls **no** crypto dependency — it stays `ext-json`.
+  - `BabelQueue\Gdpr\OpenSslCipher` — a reference AES-256-GCM cipher (random IV + 128-bit auth tag,
+    base64) on **`ext-openssl`**, an **optional** path (a Composer `suggest`, not a `require`). A
+    32/24/16-byte key selects AES-256/192/128-GCM; a wrong key or tampered ciphertext fails GCM
+    authentication and throws.
+  - `BabelQueue\Gdpr\Gdpr::protect()` / `unprotect()` — rewrite each marked leaf **in place**,
+    canonical-JSON-encoding the value then replacing it with the ciphertext string (and the exact
+    inverse), restoring values **byte-for-byte**. Supports nested objects (`profile.full_name`),
+    array items (`addresses[].line`), scalar array items, and a root mark. An absent marked field
+    is skipped; a non-string leaf on `unprotect()` is left untouched (idempotent on cleartext); a
+    wrong key throws the typed `BabelQueue\Gdpr\DecryptException` so the message takes retry / DLQ.
+  - `BabelQueue\Schema\SensitivePaths` / `SensitivePath` — parse the `x-gdpr-sensitive` keyword
+    (boolean `true` or a non-empty category string) from a decoded `data` schema and expose the
+    sensitive paths, mirroring the Go `schema.SensitivePaths()`. Parsing is **validation-neutral**
+    — annotating a schema is never a breaking change. Strictly opt-in; schema validation still runs
+    on **cleartext** (validate before `protect()` / after `unprotect()`).
+
 ## [1.15.0] - 2026-06-21
 
 ### Added

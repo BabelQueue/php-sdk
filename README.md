@@ -37,6 +37,7 @@ composer require babelqueue/php-sdk
 | Redrive | `BabelQueue\Redrive\Redrive` / `RedriveIO` / `RedriveOptions` | Safe DLQ replay (ADR-0026): reset + dry-run + sandbox + select, driven through a `RedriveIO` you bind to your broker. |
 | | `BabelQueue\Redrive\ReplayBypass` / `HeaderRedriveIO` | Replay-bypass (ADR-0027): a redrive can stamp `bq-replay-bypass` so a handler skips already-fired external effects (`bypassExternalEffects`). |
 | Outbox | `BabelQueue\Outbox\Outbox` / `OutboxRelay` / `OutboxStore` | Transactional outbox (ADR-0029): persist the message **atomically with the business write**, relay it later. Dependency-free — `OutboxStore` is an interface you bind to your DB. |
+| GDPR | `BabelQueue\Gdpr\Gdpr` / `Cipher` / `OpenSslCipher` | Opt-in field-level encryption (ADR-0030) of the `data` fields a schema marked `x-gdpr-sensitive`: `Gdpr::protect()` before publish, `Gdpr::unprotect()` after decode. The envelope stays frozen — a sensitive value becomes a ciphertext **string**. The `Cipher` is a caller-provided seam (bind a KMS/Vault); the reference `OpenSslCipher` (AES-256-GCM) is `ext-openssl`-only and a `suggest`. |
 | Tracing | `BabelQueue\Otel\Tracing` | Optional OpenTelemetry produce/consume spans (ADR-0025/0028): correlate across hops via `trace_id`, and — when the transport carries headers — link spans across hops via a W3C `traceparent`. Opt-in; `open-telemetry/api` is a `suggest`. |
 | Headers | `BabelQueue\Contracts\HeaderPublisher` / `HasHeaders` | The out-of-band transport-header seam (ADR-0027/0028): publish headers **beside** the frozen envelope, and surface them on a consumed message. |
 | Routing | `BabelQueue\Routing\UnknownUrnStrategy` | `fail` / `delete` / `release` / `dead_letter` constants. |
@@ -177,6 +178,89 @@ $relay->drain();                              // publishes verbatim, marks publi
 **InitORM-backed** adapter + the outbox-table DDL live in
 [`babelqueue-examples/outbox-initorm/`](https://github.com/BabelQueue/babelqueue-examples/tree/main/outbox-initorm),
 keeping this core DB-free.
+
+## GDPR field encryption (ADR-0030)
+
+When a schema marks a `data` field `x-gdpr-sensitive`, BabelQueue can **encrypt that field's
+value end-to-end**: the producer encrypts it before publish, the consumer decrypts it after
+decode. It is opt-in and standalone — a producer/consumer that never calls it behaves exactly
+as before.
+
+The **envelope stays frozen** (GR-1): only the sensitive *value* changes — it becomes a
+ciphertext **string**, so `data` stays pure JSON (GR-3), `meta.schema_version` stays `1`, and
+`trace_id` is untouched (GR-4). An SDK or hop without the key still carries the envelope
+byte-compatibly; it just can't read the protected fields.
+
+The crypto is a **caller-provided `Cipher`** (GR-7 — the core pulls no crypto dependency, it
+stays `ext-json`). Bind it to your KMS / Vault / HSM / tokenisation service, or use the bundled
+reference `OpenSslCipher` (AES-256-GCM) — which needs `ext-openssl`, an **optional** `suggest`:
+
+```bash
+# only if you use the reference cipher; otherwise bind your own Cipher onto a KMS/Vault
+docker-php-ext-enable openssl   # ext-openssl is usually already present
+```
+
+```php
+use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\Gdpr\Gdpr;
+use BabelQueue\Gdpr\OpenSslCipher;
+use BabelQueue\Schema\SchemaValidated;
+
+$cipher = new OpenSslCipher($key);            // 32 bytes ⇒ AES-256-GCM; key is yours to manage
+$schema = $provider->schemaFor('urn:babel:orders:created');
+
+// PRODUCE — validate CLEARTEXT first, then encrypt marked leaves in place, then encode.
+$data = ['email' => 'alice@example.com', 'order_id' => 1042];
+if ($schema !== null) {
+    SchemaValidated::assert($provider, 'urn:babel:orders:created', $data); // cleartext
+    Gdpr::protect($data, $schema, $cipher);   // 'email' becomes a ciphertext string, in place
+}
+$body = EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', $data, 'orders'));
+
+// CONSUME — decode, decrypt marked leaves in place, THEN read/validate cleartext.
+$envelope = EnvelopeCodec::decode($body);
+$data = $envelope['data'];
+if ($schema !== null) {
+    Gdpr::unprotect($data, $schema, $cipher); // restores 'email' byte-for-byte
+}
+```
+
+Mark a field in the `data` schema with the `x-gdpr-sensitive` keyword — the boolean `true`, or a
+free-form category string for documentation. It is **validation-neutral** (it never makes a value
+valid or invalid), so annotating a schema is never a breaking change:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "email":   {"type": "string", "x-gdpr-sensitive": "email"},
+    "profile": {"type": "object", "properties": {
+        "full_name": {"type": "string", "x-gdpr-sensitive": true}
+    }},
+    "addresses": {"type": "array", "items": {"type": "object", "properties": {
+        "line": {"type": "string", "x-gdpr-sensitive": true}
+    }}}
+  }
+}
+```
+
+`Gdpr::protect()` / `unprotect()` walk every marked leaf — nested objects (`profile.full_name`),
+array items (`addresses[].line`), scalar array items, and a root mark — and rewrite each **in
+place**. Each value is canonically JSON-encoded then replaced by the ciphertext string (and the
+exact inverse on the way back), so the round-trip restores the original value **byte-for-byte**.
+Behaviour at the edges:
+
+- **Validate cleartext** — run schema validation *before* `protect()` and *after* `unprotect()`; a
+  constrained sensitive field (`minLength`, `enum`, …) would reject the ciphertext string otherwise.
+- **Absent field** — a marked path missing from a message is skipped (not an error); schemas evolve.
+- **Idempotent decrypt** — a non-string leaf is left untouched, so `unprotect()` is safe to re-run
+  on already-cleartext data.
+- **Wrong key / tampered** — `unprotect()` throws the typed `BabelQueue\Gdpr\DecryptException`, so
+  the consumer fails the message (retry / dead-letter) rather than process unreadable PII.
+
+The sensitive marks are read from the same per-URN `data` schema the validation path already loads
+(`BabelQueue\Schema\SensitivePaths` exposes them, mirroring babelqueue-registry's inventory). The
+registry **declares and audits** sensitivity; this is the SDK that **enforces** it on the wire.
 
 ## OpenTelemetry tracing (ADR-0025 / ADR-0028)
 
