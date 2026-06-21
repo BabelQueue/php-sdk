@@ -9,6 +9,46 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-06-21
+
+### Added
+- **Persistent idempotency stores (ADR-0022).** Two production-grade backends now implement the
+  frozen `BabelQueue\Idempotency\IdempotencyStore` so a fleet of consumers shares one dedupe record,
+  plus a new opt-in `BabelQueue\Idempotency\ClaimingStore` extension (`claim()` / `release()`) that
+  adds the **atomic in-flight claim** the single-process `InMemoryStore` cannot:
+  - `BabelQueue\Idempotency\PdoStore` — Postgres / MySQL / SQLite over **PDO** (a PHP extension, so
+    nothing is added to `require` — GR-7 intact). The atomic claim is a portable **unique-key
+    `INSERT` caught as a duplicate** (every engine enforces the `message_id` PRIMARY KEY atomically —
+    no `ON CONFLICT` / `INSERT IGNORE` dialect branch needed); an expired claim is re-acquired by one
+    conditional `UPDATE … WHERE state='claimed' AND expires_at < now`. Ship the table with
+    `PdoStore::ddl()`; the table name is injectable and identifier-validated.
+  - `BabelQueue\Idempotency\RedisStore` — atomic claim via `SET key value NX PX <ttl_ms>` (the same
+    idiom Go/Python use), riding the same optional `predis/predis` client as `RedisTransport`. A
+    commit drops the TTL (a committed id is permanent); `release()` is a Lua compare-and-delete so it
+    never clobbers a commit.
+  - `BabelQueue\Idempotency\ClaimingDispatch::wrap()` drives the claim/commit/release lifecycle: a
+    claim won runs + commits, a committed duplicate skips, a delivery that loses to an in-flight peer
+    throws `ClaimParkedException` so it is **parked** (redelivered, not acked), and a thrown handler
+    releases the claim for prompt retry. TTL bounds a crash between claim and commit (still
+    at-least-once, never exactly-once). `Idempotent::wrap` still drives any `IdempotencyStore`
+    unchanged. The frozen base interface is untouched; `schema_version` stays **1**.
+- **Replay-bypass guard — PHP parity (ADR-0027).** A deliberate DLQ replay can now tell its handler
+  to skip external side-effects that already fired (don't re-charge, don't re-email), while the
+  idempotent core still runs — matching the Go reference. It rides the out-of-band transport-header
+  seam (`HeaderPublisher` / `HasHeaders` / `Support\Headers`) shipped for OTel (ADR-0028); the marker
+  rides **beside** the frozen envelope, never in it (GR-1):
+  - `BabelQueue\Redrive\ReplayBypass` — the consume-side guard: `HEADER` (`bq-replay-bypass`,
+    identical to Go's `HeaderReplayBypass`, so a Go-produced replay is recognised by a PHP consumer),
+    `isReplay(HasHeaders)`, `bypassExternalEffects(HasHeaders, fn)` and a `wrap()` decorator — the
+    PHP mirror of Go's `IsReplay` / `BypassExternalEffects`.
+  - `BabelQueue\Redrive\HeaderRedriveIO` — an optional `RedriveIO` capability (`publishWithHeaders`)
+    so the publish-only redrive seam can carry the marker (the analogue of Go's `HeaderPublisher`
+    check).
+  - `RedriveOptions::$bypass` + `RedriveItem::$bypassed` — `Redrive::run()` with `bypass: true` over
+    a `HeaderRedriveIO` stamps the marker on each redriven message and sets `bypassed`; over a plain
+    `RedriveIO` it is a best-effort no-op (`bypassed` stays false). `schema_version` stays **1**;
+    `trace_id` preserved (GR-4).
+
 ## [1.14.0] - 2026-06-21
 
 ### Added

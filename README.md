@@ -32,6 +32,10 @@ composer require babelqueue/php-sdk
 | Validation | `BabelQueue\Validation\EnvelopeValidator` | Consumer-side validation **with a reason** — quarantine an unsupported `meta.schema_version` instead of dropping it. |
 | Transports | `BabelQueue\Transport\RedisTransport` / `AmqpTransport` | Optional framework-less reference `Transport` impls (Redis `RPUSH`; RabbitMQ durable + contract AMQP properties). |
 | Dead-letter | `BabelQueue\DeadLetter\DeadLetter` | Annotate an envelope with the additive `dead_letter` block (ADR-0009). |
+| Idempotency | `BabelQueue\Idempotency\Idempotent` / `IdempotencyStore` / `InMemoryStore` | Dedupe on `meta.id` (ADR-0022): `Idempotent::wrap($store, $handler)` skips an already-processed message. |
+| | `BabelQueue\Idempotency\ClaimingStore` / `PdoStore` / `RedisStore` / `ClaimingDispatch` | **Persistent** stores for a fleet: an **atomic claim** (PDO unique-INSERT / Redis `SET NX PX`) serializes concurrent deliveries of one id. `PdoStore` is `ext-pdo`-only; `RedisStore` reuses the optional `predis` client. |
+| Redrive | `BabelQueue\Redrive\Redrive` / `RedriveIO` / `RedriveOptions` | Safe DLQ replay (ADR-0026): reset + dry-run + sandbox + select, driven through a `RedriveIO` you bind to your broker. |
+| | `BabelQueue\Redrive\ReplayBypass` / `HeaderRedriveIO` | Replay-bypass (ADR-0027): a redrive can stamp `bq-replay-bypass` so a handler skips already-fired external effects (`bypassExternalEffects`). |
 | Outbox | `BabelQueue\Outbox\Outbox` / `OutboxRelay` / `OutboxStore` | Transactional outbox (ADR-0029): persist the message **atomically with the business write**, relay it later. Dependency-free — `OutboxStore` is an interface you bind to your DB. |
 | Tracing | `BabelQueue\Otel\Tracing` | Optional OpenTelemetry produce/consume spans (ADR-0025/0028): correlate across hops via `trace_id`, and — when the transport carries headers — link spans across hops via a W3C `traceparent`. Opt-in; `open-telemetry/api` is a `suggest`. |
 | Headers | `BabelQueue\Contracts\HeaderPublisher` / `HasHeaders` | The out-of-band transport-header seam (ADR-0027/0028): publish headers **beside** the frozen envelope, and surface them on a consumed message. |
@@ -74,6 +78,68 @@ if ($reason = EnvelopeValidator::check($envelope)) {
 
 phpredis (`ext-redis`) users can implement the one-method `Transport` directly —
 it is just an `rpush`.
+
+## Idempotency — dedupe on `meta.id` (ADR-0022)
+
+BabelQueue is **at-least-once**, so handlers should be idempotent — dedupe on the envelope's
+`meta.id`. `Idempotent::wrap($store, $handler)` makes that a one-liner: a previously-succeeded id is
+skipped + acked; a throw leaves it unmarked so retry/DLQ still apply. The reference `InMemoryStore`
+is single-process; for a **fleet** of consumers two **persistent** stores share one dedupe record
+and add an **atomic claim** so two workers handed the same id never both run (GR-7 — nothing added to
+`require`):
+
+```php
+use BabelQueue\Idempotency\ClaimingDispatch;
+use BabelQueue\Idempotency\PdoStore;
+use BabelQueue\Idempotency\RedisStore;
+
+// PDO — Postgres / MySQL / SQLite. Atomic claim = a unique-key INSERT caught as a duplicate
+// (every engine enforces the PRIMARY KEY atomically — no dialect-specific upsert). Ship the table:
+$pdo->exec(PdoStore::ddl());                 // CREATE TABLE IF NOT EXISTS bq_idempotency (...)
+$store = new PdoStore($pdo);
+
+// Redis — atomic claim = SET key value NX PX <ttl>. Reuses your predis client.
+$store = new RedisStore($predis);
+
+// ClaimingDispatch drives claim → run → commit; a duplicate skips, a concurrent in-flight
+// delivery parks (throws ClaimParkedException → redelivered, not acked), a throw releases the claim.
+$dispatch->on('urn:babel:orders:created', ClaimingDispatch::wrap($store, fn ($m) => handle($m)));
+```
+
+A claim's TTL bounds a crash between claim and commit, after which a redelivery may re-run — still
+at-least-once, **not** exactly-once (the dual-write window; the outbox below narrows the produce
+side). The frozen `IdempotencyStore` interface is untouched; the claim contract is the opt-in
+`ClaimingStore` extension.
+
+## Safe DLQ replay + replay-bypass (ADR-0026 / ADR-0027)
+
+`Redrive` replays dead-lettered messages back to their source (or a sandbox) — reset for
+reprocessing, with dry-run and `select`, driven through a `RedriveIO` you bind to your broker.
+Replaying into the *real* queue re-runs the handler, so its external effects (charge, email) would
+re-fire. **Replay-bypass** closes that: a redrive can stamp the out-of-band `bq-replay-bypass`
+transport header (beside the frozen envelope, never in it — GR-1), and a handler wraps its external,
+non-idempotent side in `ReplayBypass::bypassExternalEffects()` to skip it on a replay while the
+idempotent core still runs.
+
+```php
+use BabelQueue\Redrive\Redrive;
+use BabelQueue\Redrive\RedriveOptions;
+use BabelQueue\Redrive\ReplayBypass;
+
+// Producer side — stamp the marker on a replay (needs a RedriveIO that also implements
+// HeaderRedriveIO; over a plain RedriveIO bypass is a best-effort no-op and item->bypassed = false).
+Redrive::run($io, 'orders.dlq', new RedriveOptions(bypass: true));
+
+// Consumer side — the idempotent core always runs; the external effect is skipped on a replay.
+$dispatch->on('urn:babel:orders:created', static function ($m): void {
+    saveOrder($m);                                   // idempotent core
+    ReplayBypass::bypassExternalEffects($m, static fn () => sendConfirmationEmail($m));
+});
+```
+
+The marker `bq-replay-bypass` is identical across SDKs (Go's `HeaderReplayBypass`), so a Go-produced
+replay is recognised by a PHP consumer. It rides the same `HeaderPublisher` / `HasHeaders` seam as
+the OTel `traceparent`; `schema_version` stays **1** and `trace_id` is preserved.
 
 ## Transactional outbox (ADR-0029)
 

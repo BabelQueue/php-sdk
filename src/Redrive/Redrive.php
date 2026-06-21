@@ -24,11 +24,13 @@ use Throwable;
  * exposed on its own for callers that re-publish through their own machinery. The envelope stays
  * frozen (GR-1) and nothing is added to `require`.
  *
- * Scope: `dryRun` + `select` + a sandbox `toQueue` are the safe-replay primitives here. The
- * **Replay-Bypass** guard — a `bq-replay-bypass` transport header surfaced to handlers so a
- * replay can skip external side-effects (don't re-charge, don't re-email) — is a documented
- * phase two; like ADR-0025's `traceparent` follow-up it carries out-of-band metadata as a
- * transport header and so touches the runtime + every transport binding.
+ * Scope: `dryRun` + `select` + a sandbox `toQueue` are the safe-replay primitives. The
+ * **Replay-Bypass** guard (ADR-0027) is also wired here: with `RedriveOptions(bypass: true)` and a
+ * {@see HeaderRedriveIO}, each redriven message is stamped with the `bq-replay-bypass` transport
+ * header so a handler can skip external side-effects that already ran ({@see ReplayBypass}). The
+ * marker rides out of band beside the frozen envelope (GR-1); a plain {@see RedriveIO} cannot carry
+ * it, so `bypass` is a best-effort no-op there and the per-item `bypassed` flag stays false — the
+ * exact best-effort contract Go's `Redrive` uses against its `HeaderPublisher` check (ADR-0027).
  */
 final class Redrive
 {
@@ -118,7 +120,7 @@ final class Redrive
 
             $body = EnvelopeCodec::encode(self::reset($env));
             try {
-                $io->publish($target, $body);
+                $bypassed = self::publishRedriven($io, $target, $body, $options->bypass);
             } catch (Throwable $e) {
                 $io->publish($dlq, $p['body']); // restore on a publish failure, then surface it
                 $io->ack($p['handle']);
@@ -127,10 +129,29 @@ final class Redrive
             }
             $io->ack($p['handle']);
             $redriven++;
-            $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, true);
+            $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, true, $bypassed);
         }
 
         return new RedriveResult($redriven, $skipped, $items);
+    }
+
+    /**
+     * Re-publish a reset message to $queue, stamping the `bq-replay-bypass` marker when $bypass is
+     * set AND the IO can carry headers ({@see HeaderRedriveIO}); returns whether the marker was
+     * actually stamped. With no bypass, or a plain {@see RedriveIO}, it publishes plainly and
+     * returns false. The PHP mirror of Go's `publishRedriven` (ADR-0027).
+     */
+    private static function publishRedriven(RedriveIO $io, string $queue, string $body, bool $bypass): bool
+    {
+        if ($bypass && $io instanceof HeaderRedriveIO) {
+            $io->publishWithHeaders($queue, $body, ReplayBypass::markerHeaders());
+
+            return true;
+        }
+
+        $io->publish($queue, $body);
+
+        return false;
     }
 
     /**

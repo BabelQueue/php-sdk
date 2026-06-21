@@ -6,9 +6,11 @@ namespace BabelQueue\Tests\Redrive;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
+use BabelQueue\Redrive\HeaderRedriveIO;
 use BabelQueue\Redrive\Redrive;
 use BabelQueue\Redrive\RedriveIO;
 use BabelQueue\Redrive\RedriveOptions;
+use BabelQueue\Redrive\ReplayBypass;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -43,6 +45,46 @@ final class FakeIO implements RedriveIO
             throw new RuntimeException('publish refused');
         }
         $this->queues[$queue][] = $body;
+    }
+}
+
+/**
+ * A header-capable {@see HeaderRedriveIO}: same in-memory pop/ack/publish as {@see FakeIO}, plus it
+ * records the out-of-band headers each re-published body carried, so a test can assert the
+ * `bq-replay-bypass` marker was actually stamped (the seam Go's `Redrive` rides via its
+ * `HeaderPublisher` check).
+ */
+final class HeaderFakeIO implements HeaderRedriveIO
+{
+    /** @var array<string, list<string>> */
+    public array $queues = [];
+
+    /** @var array<string, list<array<string, string>>> queue => per-message header maps */
+    public array $headers = [];
+
+    public function pop(string $queue): ?array
+    {
+        if (empty($this->queues[$queue])) {
+            return null;
+        }
+
+        return ['body' => array_shift($this->queues[$queue]), 'handle' => null];
+    }
+
+    public function ack(mixed $handle): void
+    {
+        // no-op: pop already removed the message
+    }
+
+    public function publish(string $queue, string $body): void
+    {
+        $this->queues[$queue][] = $body;
+    }
+
+    public function publishWithHeaders(string $queue, string $body, array $headers): void
+    {
+        $this->publish($queue, $body);
+        $this->headers[$queue][] = $headers;
     }
 }
 
@@ -180,5 +222,50 @@ final class RedriveTest extends TestCase
         $this->assertSame(0, $reset['attempts']);
         $this->assertSame($dl['trace_id'], $reset['trace_id']);
         $this->assertArrayHasKey('dead_letter', $dl); // original argument unchanged (pure)
+    }
+
+    public function testBypassStampsTheReplayMarkerOnAHeaderCapableIo(): void
+    {
+        $io = new HeaderFakeIO();
+        $io->publish('orders.dlq', EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders')));
+
+        $res = Redrive::run($io, 'orders.dlq', new RedriveOptions(bypass: true));
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertTrue($res->items[0]->bypassed, 'the marker was stamped on a HeaderRedriveIO');
+        // The redriven message carried exactly the bq-replay-bypass marker beside the envelope.
+        $this->assertSame([ReplayBypass::markerHeaders()], $io->headers['orders']);
+        // The re-published body is still the reset, frozen envelope (GR-1) — the marker rides beside it.
+        $back = EnvelopeCodec::decode($io->queues['orders'][0]);
+        $this->assertArrayNotHasKey('dead_letter', $back);
+        $this->assertSame(0, $back['attempts']);
+    }
+
+    public function testBypassIsANoOpOnAPlainIo(): void
+    {
+        // A RedriveIO that cannot carry headers: bypass is best-effort, so it degrades to a plain
+        // re-publish and the per-item bypassed flag stays false (ADR-0027).
+        $io = new FakeIO();
+        $io->publish('orders.dlq', EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders')));
+
+        $res = Redrive::run($io, 'orders.dlq', new RedriveOptions(bypass: true));
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertFalse($res->items[0]->bypassed, 'a plain RedriveIO cannot carry the marker');
+        $this->assertCount(1, $io->queues['orders']);
+    }
+
+    public function testWithoutBypassNoMarkerIsStampedEvenOnAHeaderCapableIo(): void
+    {
+        // A normal redrive (no bypass) re-publishes plainly — no replay marker, byte-identical body.
+        $io = new HeaderFakeIO();
+        $io->publish('orders.dlq', EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders')));
+
+        $res = Redrive::run($io, 'orders.dlq');
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertFalse($res->items[0]->bypassed);
+        $this->assertArrayNotHasKey('orders', $io->headers); // publishWithHeaders never called
+        $this->assertCount(1, $io->queues['orders']);
     }
 }
