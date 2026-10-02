@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Transport\KafkaProducer;
 use BabelQueue\Transport\KafkaRetryConsumer;
 use BabelQueue\Transport\KafkaRetryConsumerClient;
@@ -201,5 +202,51 @@ final class KafkaRetryConsumerTest extends TestCase
         );
 
         $this->addToAssertionCount(1);
+    }
+
+    public function test_reinjects_an_undecodable_record_verbatim(): void
+    {
+        $poison = '{"job":"urn:babel:orders:created","trace_id":"trace-1","data":[1,2],'
+            . '"meta":{"id":"msg-1","queue":"orders","schema_version":1},"attempts":1}';
+
+        $client = Mockery::mock(KafkaRetryConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw([
+            'bq-original-topic' => 'orders',
+            'bq-job' => 'urn:babel:orders:created',
+            'bq-attempts' => '2',
+        ], $poison));
+        $client->shouldReceive('commit')->once();
+
+        $captured = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->with(
+            'orders',
+            Mockery::on(function (string $payload) use (&$captured): bool {
+                $captured['payload'] = $payload;
+
+                return true;
+            }),
+            Mockery::on(function (array $headers) use (&$captured): bool {
+                $captured['headers'] = $headers;
+
+                return true;
+            }),
+            Mockery::type('int'),
+        );
+
+        EnvelopeCodec::setWarningHandler(static function (): void {});
+        try {
+            $calls = 0;
+            (new KafkaRetryConsumer($client, $producer))->consume(
+                function () use (&$calls): bool {
+                    return $calls++ >= 1;
+                },
+            );
+        } finally {
+            EnvelopeCodec::setWarningHandler(null);
+        }
+
+        $this->assertSame($poison, $captured['payload']); // not re-encoded from the empty envelope
+        $this->assertSame(['bq-job' => 'urn:babel:orders:created', 'bq-attempts' => '2'], $captured['headers']);
     }
 }

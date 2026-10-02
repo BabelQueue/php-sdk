@@ -82,7 +82,9 @@ final class SqsTransport implements HeaderPublisher
     private function send(string $payload, ?string $queue, array $extraHeaders): ?string
     {
         $url = $queue ?? $this->queueUrl;
-        $envelope = EnvelopeCodec::decode($payload);
+        // Decoded only to project the transport headers; the payload is published verbatim, so a
+        // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
+        $envelope = EnvelopeCodec::decode($payload, static function (): void {});
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
 
         $args = [

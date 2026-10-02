@@ -153,4 +153,12 @@ final class KafkaConsumerTest extends TestCase
 
         $this->assertSame(0, $handlerCalls);
     }
+
+    public function test_receive_carries_the_raw_body_for_the_dead_letter_path(): void
+    {
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw(['bq-attempts' => '0']));
+
+        $this->assertSame(self::ENVELOPE, (new KafkaConsumer($client))->receive()->rawBody());
+    }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Exceptions\InvalidEnvelopeException;
 use BabelQueue\Validation\EnvelopeValidator;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -112,6 +113,14 @@ final class EnvelopeValidatorTest extends TestCase
         EnvelopeValidator::validate(self::base());
 
         $this->expectNotToPerformAssertions();
+    }
+
+    public function test_a_decoded_object_data_with_index_like_keys_is_valid(): void
+    {
+        $raw = '{"job":"urn:babel:x","trace_id":"t","attempts":0,"data":{"0":"a","1":"b"},'
+            . '"meta":{"schema_version":1,"id":"m"}}';
+
+        $this->assertNull(EnvelopeValidator::check(EnvelopeCodec::decode($raw)));
     }
 
     public function test_unsupported_schema_version_is_flagged_for_quarantine(): void

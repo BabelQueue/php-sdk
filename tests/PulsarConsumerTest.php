@@ -125,4 +125,12 @@ final class PulsarConsumerTest extends TestCase
 
         $this->assertSame(0, $handlerCalls); // null receive → handler never called
     }
+
+    public function test_receive_carries_the_raw_body_for_the_dead_letter_path(): void
+    {
+        $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw());
+
+        $this->assertSame(self::ENVELOPE, (new PulsarConsumer($client))->receive()->rawBody());
+    }
 }

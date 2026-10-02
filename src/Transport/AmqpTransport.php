@@ -64,7 +64,9 @@ final class AmqpTransport implements HeaderPublisher
     private function send(string $payload, ?string $queue, array $extraHeaders): ?string
     {
         $target = $queue ?? $this->defaultQueue;
-        $envelope = EnvelopeCodec::decode($payload);
+        // Decoded only to project the transport headers; the payload is published verbatim, so a
+        // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
+        $envelope = EnvelopeCodec::decode($payload, static function (): void {});
 
         // passive=false, durable=true, exclusive=false, auto_delete=false.
         $this->channel->queue_declare($target, false, true, false, false);

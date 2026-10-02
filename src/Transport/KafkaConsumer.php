@@ -61,7 +61,7 @@ final class KafkaConsumer
 
         // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
         // record's original work topic (bq-original-topic) across hops.
-        return new KafkaMessage($envelope, $raw['headers']);
+        return new KafkaMessage($envelope, $raw['headers'], $raw['payload']);
     }
 
     /**

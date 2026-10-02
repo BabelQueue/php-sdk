@@ -8,6 +8,8 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\HasTraceId;
 use BabelQueue\Contracts\PolyglotJob;
 use BabelQueue\Exceptions\BabelQueueException;
+use BabelQueue\Validation\EnvelopeValidator;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -80,6 +82,170 @@ final class EnvelopeCodecTest extends TestCase
         $this->expectException(BabelQueueException::class);
 
         EnvelopeCodec::fromJob(new BlankUrnJobStub(), 'orders');
+    }
+
+    public function test_empty_data_encodes_as_a_json_object(): void
+    {
+        $json = EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', [], 'orders'));
+
+        self::assertStringContainsString('"data":{}', $json);
+        self::assertStringNotContainsString('"data":[]', $json);
+    }
+
+    public function test_non_empty_assoc_data_encoding_is_unchanged(): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 1, 'tags' => []], 'orders');
+
+        self::assertStringContainsString('"data":{"order_id":1,"tags":[]}', EnvelopeCodec::encode($envelope));
+    }
+
+    public function test_decode_rejects_list_data_with_a_warning(): void
+    {
+        $warnings = [];
+        $raw = '{"job":"urn:babel:x","trace_id":"t","data":[1,2],"meta":{"schema_version":1},"attempts":0}';
+
+        $envelope = EnvelopeCodec::decode($raw, static function (string $m, string $p) use (&$warnings): void {
+            $warnings[] = $p;
+        });
+
+        self::assertSame([], $envelope);
+        self::assertFalse(EnvelopeCodec::accepts($envelope));
+        self::assertSame(['/data'], $warnings);
+    }
+
+    public function test_accepts_any_array_data_since_encode_always_writes_an_object(): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:x', [], 'q');
+        self::assertTrue(EnvelopeCodec::accepts($envelope));
+
+        // A decoded PHP array cannot tell [1,2] from {"0":1,"1":2}; decode() owns the list verdict.
+        $envelope['data'] = [1, 2];
+        self::assertTrue(EnvelopeCodec::accepts($envelope));
+
+        $envelope['data'] = 'not-an-object';
+        self::assertFalse(EnvelopeCodec::accepts($envelope));
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function objectDataBodies(): array
+    {
+        return [
+            'index-like keys' => ['{"0":"a","1":"b"}', '{"0":"a","1":"b"}'],
+            'single index-like key' => ['{"0":"a"}', '{"0":"a"}'],
+            'empty object' => ['{}', '{}'],
+            'legacy empty array (php-sdk <= 1.16.0)' => ['[]', '{}'],
+        ];
+    }
+
+    #[DataProvider('objectDataBodies')]
+    public function test_decode_accepts_object_data_by_its_raw_json_shape(string $data, string $reencoded): void
+    {
+        $warnings = [];
+        $raw = '{"job":"urn:babel:x","trace_id":"t","attempts":0,"data":' . $data
+            . ',"meta":{"schema_version":1,"id":"m"}}';
+
+        $envelope = EnvelopeCodec::decode($raw, static function (string $m, string $p) use (&$warnings): void {
+            $warnings[] = $p;
+        });
+
+        self::assertSame([], $warnings);
+        self::assertSame('urn:babel:x', EnvelopeCodec::urn($envelope));
+        self::assertTrue(EnvelopeCodec::accepts($envelope));
+        self::assertNull(EnvelopeValidator::check($envelope));
+        self::assertStringContainsString('"data":' . $reencoded . ',', EnvelopeCodec::encode($envelope));
+    }
+
+    public function test_decode_rejects_list_data_even_when_nested_objects_have_index_keys(): void
+    {
+        $warnings = [];
+        $raw = '{"job":"urn:babel:x","trace_id":"t","attempts":0,"data":[{"0":"a"}],"meta":{"schema_version":1}}';
+
+        $envelope = EnvelopeCodec::decode($raw, static function (string $m, string $p) use (&$warnings): void {
+            $warnings[] = $p;
+        });
+
+        self::assertSame([], $envelope);
+        self::assertSame(['/data'], $warnings);
+    }
+
+    public function test_encode_writes_list_shaped_data_as_an_object(): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:x', [], 'q');
+        $envelope['data'] = ['a', 'b'];
+
+        self::assertStringContainsString('"data":{"0":"a","1":"b"}', EnvelopeCodec::encode($envelope));
+    }
+
+    public function test_nested_lists_inside_data_stay_json_arrays(): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:x', ['items' => [1, 2]], 'q');
+
+        self::assertStringContainsString('"data":{"items":[1,2]}', EnvelopeCodec::encode($envelope));
+    }
+
+    public function test_decode_drops_forbidden_keys_via_the_global_warning_handler(): void
+    {
+        $warnings = [];
+        EnvelopeCodec::setWarningHandler(static function (string $m, string $p) use (&$warnings): void {
+            $warnings[] = $m;
+        });
+
+        try {
+            $envelope = EnvelopeCodec::decode(
+                '{"job":"urn:babel:x","trace_id":"t","data":{},"meta":{"schema_version":1,"ts":1},"attempts":0,"timestamp":1}',
+            );
+        } finally {
+            EnvelopeCodec::setWarningHandler(null);
+        }
+
+        self::assertArrayNotHasKey('timestamp', $envelope);
+        self::assertArrayNotHasKey('ts', $envelope['meta']);
+        self::assertCount(2, $warnings);
+        self::assertStringContainsString('/timestamp', $warnings[0]);
+        self::assertStringContainsString('/meta/ts', $warnings[1]);
+        self::assertTrue(EnvelopeCodec::accepts($envelope));
+    }
+
+    public function test_encode_and_decode_warnings_say_what_actually_happened(): void
+    {
+        $warnings = [];
+        EnvelopeCodec::setWarningHandler(static function (string $m) use (&$warnings): void {
+            $warnings[] = $m;
+        });
+
+        try {
+            $envelope = EnvelopeCodec::make('urn:babel:x', [], 'q');
+            $envelope['timestamp'] = 1;
+            EnvelopeCodec::encode($envelope);
+            EnvelopeCodec::decode('{"job":"urn:babel:x","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0,"timestamp":1}');
+        } finally {
+            EnvelopeCodec::setWarningHandler(null);
+        }
+
+        self::assertCount(2, $warnings);
+        self::assertStringContainsString('it was not emitted', $warnings[0]);
+        self::assertStringContainsString('it was dropped from the decoded envelope', $warnings[1]);
+    }
+
+    public function test_warnings_fall_back_to_error_log_without_any_handler(): void
+    {
+        $log = tempnam(sys_get_temp_dir(), 'bq-log');
+        self::assertIsString($log);
+        $previous = ini_set('error_log', $log);
+
+        try {
+            EnvelopeCodec::setWarningHandler(null);
+            EnvelopeCodec::decode('{"job":"urn:babel:x","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0,"timestamp":1}');
+        } finally {
+            ini_set('error_log', $previous === false ? '' : $previous);
+        }
+
+        $contents = (string) file_get_contents($log);
+        unlink($log);
+
+        self::assertStringContainsString('[babelqueue] BabelQueue envelope carries the forbidden key /timestamp', $contents);
     }
 
     public function test_encode_decode_round_trips(): void

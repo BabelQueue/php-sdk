@@ -54,7 +54,7 @@ final class PulsarConsumer
         $body = $envelope['attempts'] ?? 0;
         $envelope['attempts'] = max(is_int($body) ? $body : 0, $raw['redeliveryCount']);
 
-        return new PulsarMessage($envelope, $raw['messageId']);
+        return new PulsarMessage($envelope, $raw['messageId'], $raw['payload']);
     }
 
     /**

@@ -9,6 +9,81 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-10-01
+
+MINOR: new public API (warning sinks, `HasRawBody`, the `FORBIDDEN_*`
+constants) alongside the fixes below. The envelope stays at
+`schema_version: 1`.
+
+### Added
+- `EnvelopeCodec::decode()` takes an optional `?callable $onWarning` sink
+  (`fn (string $message, string $pointer)`), and
+  `EnvelopeCodec::setWarningHandler(?callable)` sets the process-wide sink used
+  when no per-call sink is given (`null` restores the `error_log()` fallback).
+- The `EnvelopeCodec::FORBIDDEN_*` constants listing the message-envelope.md §10
+  keys.
+- `BabelQueue\Contracts\HasRawBody` — a consumed message that can return the
+  exact body it was decoded from. `KafkaMessage` and `PulsarMessage` implement it
+  (`rawBody()`); `KafkaConsumer` and `PulsarConsumer` fill it. The new constructor
+  argument is optional and last, so existing callers are unaffected.
+
+### Fixed
+- **Empty `data` encodes as `{}`, never `[]` (R0-C7).** PHP cannot tell an empty
+  associative array from an empty list, so `EnvelopeCodec::encode()` wrote an empty
+  payload as `"data":[]`. It now writes `"data":{}` (message-envelope.md §3, GR-3);
+  a non-empty associative `data` encodes exactly as before. Decoding `{"data":{}}`
+  and re-encoding it keeps `{}`. A `data` array PHP holds as a list (such as a
+  decoded `{"0":"a","1":"b"}`) is likewise written as an object, so a decode →
+  re-encode (retry, DLQ) keeps the object shape instead of emitting a JSON array.
+- **List `data` is rejected on decode.** `EnvelopeCodec::decode()` now treats an
+  envelope whose `data` is a non-empty JSON array as poison (returns `[]`, like
+  malformed JSON) and reports a warning naming `/data`. The verdict is taken from
+  the raw JSON shape, so an object with index-like keys (`{"0":"a","1":"b"}`) is
+  accepted, as in 1.16.0 and the other SDKs. An empty `"data":[]` is still
+  accepted (read as `{}`), because 1.16.0 and earlier encoded an empty payload that
+  way. `accepts()` and `EnvelopeValidator` work on an already-decoded array, which
+  cannot tell `[1,2]` from `{"0":1,"1":2}`; they keep requiring an array `data`.
+- **A poison message keeps its body in the DLQ.** `DeadLetterPublisher` used to
+  dead-letter the empty envelope of an undecodable message. For a message that
+  carries its raw body (`HasRawBody`) it now writes the original JSON object (or
+  `{"raw": "<body>"}` for malformed JSON) plus the `dead_letter` block — the shape
+  the Laravel adapter already writes (error-handling.md §6/§7).
+  That copy is serialised as-is rather than through `encode()`, so a rejected list
+  `data` stays a JSON array in the DLQ.
+- **Kafka retry re-injection keeps an undecodable record intact.**
+  `KafkaRetryConsumer` re-injects such a record verbatim (its `bq-` headers minus
+  `bq-delay` / `bq-original-topic`) instead of re-encoding the empty envelope.
+- **Produce-side transports no longer log a misleading warning.** The AMQP, Kafka,
+  Pulsar, STOMP and SQS transports decode a payload only to project its headers and
+  publish it verbatim, so they now decode with a silent sink instead of reporting a
+  forbidden key as "dropped".
+
+### Changed
+- **Forbidden envelope keys are dropped with a warning (K-15).** The §10 keys
+  (`timestamp`, `meta.max_retries`, `meta.attempts`, `meta.source`, `meta.ts`) are
+  tolerated on decode but removed, each reported through a warning that names its
+  JSON pointer (e.g. `/meta/ts`); `encode()` never emits them. The warning says
+  what happened: "it was not emitted" on encode, "it was dropped from the decoded
+  envelope" on decode. Warnings go to the per-call `$onWarning` sink, else the
+  `setWarningHandler()` sink, else `error_log()`.
+
+### Tests
+- `BehaviourConformanceTest` runs the vendored conformance `roundtrip`,
+  `data_shape`, `forbidden_keys` and `payload_schema_unicode` sections.
+- New coverage for the DLQ raw-body path, verbatim Kafka re-injection, silent
+  transports, the warning wording and the `error_log()` fallback.
+- A PHPUnit extension (`tests/Support/ResetWarningHandlerExtension.php`) resets the
+  global warning sink after every test, so the suite is not order-dependent.
+
+### CI
+- **Release workflow: Packagist credentials moved out of the URL.** The optional
+  "Notify Packagist" step now sends `Authorization: Bearer USERNAME:API_TOKEN`
+  (Packagist's documented scheme) to `https://packagist.org/api/update-package`
+  instead of passing `username` / `apiToken` as query parameters, so the token can
+  no longer surface in request logs, proxies or curl error output. Secret names are
+  unchanged (`PACKAGIST_USERNAME`, `PACKAGIST_TOKEN`).
+- Added `.github/dependabot.yml` (weekly `composer` and `github-actions` updates).
+
 ## [1.16.0] - 2026-06-21
 
 ### Added

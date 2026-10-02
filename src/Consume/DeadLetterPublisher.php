@@ -6,6 +6,7 @@ namespace BabelQueue\Consume;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
+use BabelQueue\Contracts\HasRawBody;
 use BabelQueue\Contracts\Transport;
 use BabelQueue\DeadLetter\DeadLetter;
 use Throwable;
@@ -34,8 +35,40 @@ final class DeadLetterPublisher
         $queue = $message->getMeta()['queue'] ?? 'default';
         $queue = is_string($queue) && $queue !== '' ? $queue : 'default';
 
-        $annotated = DeadLetter::annotate($message->envelope(), $reason, $e, $queue, $message->attempts());
+        $poisonBody = $this->poisonBody($message);
+        $annotated = DeadLetter::annotate($poisonBody ?? $message->envelope(), $reason, $e, $queue, $message->attempts());
 
-        $this->transport->publish(EnvelopeCodec::encode($annotated), $queue . $this->suffix);
+        // A poison copy is written as-is: encode() would reshape a rejected list "data" into an object.
+        $body = $poisonBody === null
+            ? EnvelopeCodec::encode($annotated)
+            : json_encode($annotated, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        $this->transport->publish($body, $queue . $this->suffix);
+    }
+
+    /**
+     * The envelope to dead-letter. A poison message (its body decodes to the empty envelope — e.g.
+     * malformed JSON, or a list `data` that decode rejects) keeps an inspectable copy when the
+     * message carries its raw body ({@see HasRawBody}): the original JSON object verbatim, else
+     * `{"raw": "<body>"}` — the same shape the Laravel adapter's DLQ writes.
+     *
+     * Null when the message is not poison (or carries no raw body): its decoded envelope is used.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function poisonBody(ConsumedMessage $message): ?array
+    {
+        if (! $message instanceof HasRawBody) {
+            return null;
+        }
+
+        $raw = $message->rawBody();
+        if ($raw === null || EnvelopeCodec::decode($raw, static function (): void {}) !== []) {
+            return null;
+        }
+
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : ['raw' => $raw];
     }
 }

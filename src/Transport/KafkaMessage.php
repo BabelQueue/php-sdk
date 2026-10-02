@@ -7,6 +7,7 @@ namespace BabelQueue\Transport;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
 use BabelQueue\Contracts\HasHeaders;
+use BabelQueue\Contracts\HasRawBody;
 
 /**
  * A record received by {@see KafkaConsumer} — the framework-agnostic, read-only view of the decoded
@@ -22,15 +23,17 @@ use BabelQueue\Contracts\HasHeaders;
  * carried W3C `traceparent` would reach {@see \BabelQueue\Otel\Tracing::wrap()} once a Kafka
  * producer injects one (ADR-0028; the Kafka producer-side wiring is a documented follow-up).
  */
-final class KafkaMessage implements ConsumedMessage, HasHeaders
+final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
      * @param  array<string, string>  $headers  the raw §6 `bq-` record headers (UTF-8 strings)
+     * @param  string|null  $rawBody  the record value as received (kept for poison dead-lettering)
      */
     public function __construct(
         private readonly array $envelope,
         private readonly array $headers = [],
+        private readonly ?string $rawBody = null,
     ) {
     }
 
@@ -99,5 +102,13 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders
     public function envelope(): array
     {
         return $this->envelope;
+    }
+
+    /**
+     * The raw record value as received, or null when it was not captured.
+     */
+    public function rawBody(): ?string
+    {
+        return $this->rawBody;
     }
 }

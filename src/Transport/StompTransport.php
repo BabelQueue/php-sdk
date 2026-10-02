@@ -49,7 +49,9 @@ final class StompTransport implements Transport
     public function publish(string $payload, ?string $queue = null): ?string
     {
         $target = $queue ?? $this->defaultQueue;
-        $envelope = EnvelopeCodec::decode($payload);
+        // Decoded only to project the transport headers; the payload is published verbatim, so a
+        // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
+        $envelope = EnvelopeCodec::decode($payload, static function (): void {});
 
         $this->client->send($this->destinationPrefix.$target, $payload, $this->headers($envelope));
 

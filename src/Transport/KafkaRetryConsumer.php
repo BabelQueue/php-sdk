@@ -113,12 +113,24 @@ final class KafkaRetryConsumer
      * `bq-original-topic`. The `bq-delay` / `bq-original-topic` re-injection headers are dropped (the
      * record is back on the work topic now).
      *
+     * An undecodable record (malformed JSON, or a list `data` that decode rejects) is re-injected
+     * **verbatim** — its original body and its `bq-` headers minus the re-injection pair — instead of
+     * being re-encoded from the empty (poison) envelope, so the work-topic worker can still
+     * dead-letter an inspectable copy rather than an empty one.
+     *
      * @param  array<string, string>  $headers
      */
     private function reinject(string $payload, array $headers): void
     {
         $envelope = EnvelopeCodec::decode($payload);
         $workTopic = $this->originalTopic($headers, $envelope);
+
+        if ($envelope === []) {
+            unset($headers['bq-delay'], $headers['bq-original-topic']);
+            $this->producer->produce($workTopic, $payload, $headers, ($this->now)());
+
+            return;
+        }
 
         $this->producer->produce(
             $workTopic,

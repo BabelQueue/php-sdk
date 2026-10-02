@@ -10,6 +10,9 @@
             <directory>tests</directory>
         </testsuite>
     </testsuites>
+    <extensions>
+        <bootstrap class="BabelQueue\Tests\Support\ResetWarningHandlerExtension"/>
+    </extensions>
     <source>
         <include>
             <directory>src</directory>

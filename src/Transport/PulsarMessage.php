@@ -6,6 +6,7 @@ namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
+use BabelQueue\Contracts\HasRawBody;
 
 /**
  * A message received by {@see PulsarConsumer} — the framework-agnostic, read-only view of the
@@ -13,14 +14,16 @@ use BabelQueue\Contracts\ConsumedMessage;
  * and the §5-reconciled `attempts` counter (`max(body.attempts, redeliveryCount)`), so a handler
  * can implement its own retry/dead-letter policy on poison messages.
  */
-final class PulsarMessage implements ConsumedMessage
+final class PulsarMessage implements ConsumedMessage, HasRawBody
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
+     * @param  string|null  $rawBody  the body bytes as received (kept for poison dead-lettering)
      */
     public function __construct(
         private readonly array $envelope,
         private readonly string $messageId,
+        private readonly ?string $rawBody = null,
     ) {
     }
 
@@ -78,5 +81,13 @@ final class PulsarMessage implements ConsumedMessage
     public function envelope(): array
     {
         return $this->envelope;
+    }
+
+    /**
+     * The raw body as received, or null when it was not captured.
+     */
+    public function rawBody(): ?string
+    {
+        return $this->rawBody;
     }
 }

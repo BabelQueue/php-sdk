@@ -72,9 +72,13 @@ jobs:
           PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
         run: |
           if [ -n "$PACKAGIST_TOKEN" ]; then
-            curl -sf -XPOST -H 'content-type:application/json' \
-              "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
-              -d '{"repository":{"url":"https://github.com/BabelQueue/php-sdk"}}'
+            # Credentials travel in the Authorization header (Packagist's recommended
+            # "Bearer USERNAME:API_TOKEN" scheme), never in the URL, so they cannot
+            # leak through request logs, proxies or curl error output.
+            curl -sf -XPOST -H 'Content-Type: application/json' \
+              -H "Authorization: Bearer ${PACKAGIST_USERNAME}:${PACKAGIST_TOKEN}" \
+              'https://packagist.org/api/update-package' \
+              -d '{"repository":"https://github.com/BabelQueue/php-sdk"}'
           else
             echo "Packagist secrets not set — relying on the Packagist GitHub webhook."
           fi
