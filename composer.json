@@ -59,7 +59,7 @@
     "scripts": {
         "analyse": "phpstan analyse",
         "test": "phpunit",
-        "test:coverage": "phpunit --coverage-clover=coverage.xml",
+        "test:coverage": "phpunit --coverage-clover=coverage.xml --exclude-group benchmark",
         "coverage:check": "php bin/check-coverage.php coverage.xml 90"
     },
     "config": {
