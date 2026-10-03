@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.17.0] - 2026-10-01
+## [1.17.0] - 2026-10-03
 
 MINOR: new public API (warning sinks, `HasRawBody`, the `FORBIDDEN_*`
 constants) alongside the fixes below. The envelope stays at
