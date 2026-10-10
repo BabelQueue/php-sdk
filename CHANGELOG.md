@@ -9,16 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-10
+
+MINOR: new public API (`PulsarConsumer` `$onRoutingMismatch` hook) alongside the fixes below. The envelope stays at
+`schema_version: 1`. Operators using the Kafka retry tiers: see the Migration section below.
+
 ### Added
 - `PulsarConsumer` takes an optional `$onRoutingMismatch` callable (`fn(string $propertyUrn, string $bodyUrn, array $envelope)`),
   called when the `bq-job` property and the body URN differ. It is a separate diagnostic hook (default: none);
   an exception it throws is swallowed and never changes the acknowledge / redeliver flow. It runs after the
   `attempts` reconcile (the envelope it receives carries the reconciled value). PHP has no `accepts()` gate
   in the consumer, so unlike the other SDKs the hook is not skipped for a non-conformant envelope.
+- `PulsarMessage` takes an optional trailing `$routedUrn` constructor argument (the URN the `Dispatcher`
+  routes on; see the `bq-job` routing fix below).
 
 ### Fixed
 - `PulsarConsumer` now version-gates on `bq-schema-version` (broker-bindings §5.7 step 3). The property is read
-  before the body is decoded. A missing or blank value changes nothing; "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (`trim()` is not used: its default set contains `\0` and lacks `\f`.) any value other than
+  before the body is decoded. A missing or blank value changes nothing; "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (`trim()` is not used: its default set contains `\0` and lacks `\f`.) Any other value than
   `EnvelopeCodec::SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ... exact string match) leaves the body undecoded and
   returns a `PulsarMessage` whose routing URN is the reserved `PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . <value>`.
   No handler owns it, so the `Dispatcher` takes its existing unknown-URN path (`on_unknown_urn`), and the error
@@ -36,14 +43,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `^[0-9]+$` within int32), falling back to the body when it is absent or invalid, then floored with
   the 0-based `redeliveryCount`. Previously it routed on the body URN and ignored `bq-attempts`. The
   envelope handed to handlers is still the decoded body, and a body without a `job` is never routed.
-  `PulsarMessage` gained an optional trailing `$routedUrn` constructor argument. No version bump;
-  envelope unchanged (`schema_version: 1`).
+  The envelope is unchanged (`schema_version: 1`).
 - `KafkaRetryRouter` now publishes retry records to `<workTopic>.retry.<n>`, where
   `n` is the 1-based tier index in ascending-delay order (`orders.retry.1`,
   `orders.retry.2`, ...), as broker-bindings.md §6.4/§6.5 specify and as the
   Java/.NET/Node SDKs already do. Previously it used the delay in ms
   (`orders.retry.5000`). The `bq-delay` header (tier delay in ms) is unchanged.
-
 - `KafkaRetryRouter` sorts `delayTiersMs` ascending on construction, so
   `<workTopic>.retry.<n>` always maps to the n-th smallest delay (as in the
   Java/.NET/Node SDKs), regardless of the order the tiers were passed in.
