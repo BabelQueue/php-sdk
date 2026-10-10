@@ -38,8 +38,18 @@ use Throwable;
  * called as `fn(string $propertyUrn, string $bodyUrn, array $envelope)`. It is a separate,
  * best-effort diagnostic: any exception it throws is swallowed and the message flow is unchanged.
  * It runs after the `attempts` reconcile, so it sees the envelope the handler gets. Unlike the
- * Java/.NET/Go/Python/Node consumers, this consumer has no `accepts()` gate (the Dispatcher
- * validates downstream), so the hook is not suppressed for a non-conformant envelope.
+ * Java/.NET/Node consumers, this consumer has no `accepts()` gate and the
+ * {@see \BabelQueue\Consume\Dispatcher} does not validate the envelope either (it only looks the
+ * routing URN up), so the hook is not suppressed for a non-conformant envelope.
+ *
+ * **Version gate (§5.7 step 3).** Before the body is decoded the `bq-schema-version` property is
+ * read. A missing or blank value (empty or only ASCII whitespace) changes nothing; any value other than
+ * {@see EnvelopeCodec::SCHEMA_VERSION} (`"2"`, `"x"`, `"01"`, ...; exact string match) leaves the body
+ * undecoded and yields a message whose routing URN is the reserved
+ * {@see self::UNSUPPORTED_SCHEMA_URN_PREFIX}`<value>`. No handler owns it, so the Dispatcher takes
+ * its existing unknown-URN path (`on_unknown_urn`: release / dead-letter / ...), and the error names
+ * the rejected version. The envelope of such a message is only `['raw' => <body>, 'attempts' => n]`,
+ * so a dead-letter copy keeps the producer's bytes in the same `{"raw": ...}` shape as a poison body.
  *
  * URN dispatch, `on_unknown_urn` and DLQ routing can be handled by the framework-less
  * {@see \BabelQueue\Consume\Dispatcher} runtime (or a framework adapter): it is callable, so
@@ -50,6 +60,12 @@ final class PulsarConsumer
 {
     /** Largest valid `bq-attempts` value (int32, shared across the SDKs for parity). */
     private const MAX_ATTEMPTS = 2147483647;
+
+    /**
+     * Reserved routing URN prefix for a delivery rejected by the §5.7 version gate; the rejected
+     * `bq-schema-version` value is appended. No handler is ever registered for it.
+     */
+    public const UNSUPPORTED_SCHEMA_URN_PREFIX = 'babelqueue:unsupported-schema-version:';
 
     private readonly ?Closure $onRoutingMismatch;
 
@@ -77,8 +93,22 @@ final class PulsarConsumer
             return null;
         }
 
-        $envelope = EnvelopeCodec::decode($raw['payload']);
         $properties = $raw['properties'];
+
+        // §5.7 step 3: gate on bq-schema-version before the body is decoded.
+        $rejectedVersion = self::unsupportedSchemaVersion($properties['bq-schema-version'] ?? null);
+        if ($rejectedVersion !== null) {
+            $attempts = self::parseAttempts($properties['bq-attempts'] ?? null) ?? 0;
+
+            return new PulsarMessage(
+                ['raw' => $raw['payload'], 'attempts' => max($attempts, $raw['redeliveryCount'])],
+                $raw['messageId'],
+                $raw['payload'],
+                self::UNSUPPORTED_SCHEMA_URN_PREFIX . $rejectedVersion,
+            );
+        }
+
+        $envelope = EnvelopeCodec::decode($raw['payload']);
 
         // §5.2/§5.7: attempts = the authoritative bq-attempts property, else the body's value; then
         // floored with the 0-based redelivery count (no -1).
@@ -105,6 +135,21 @@ final class PulsarConsumer
         }
 
         return new PulsarMessage($envelope, $raw['messageId'], $raw['payload'], $routedUrn);
+    }
+
+    /**
+     * The `bq-schema-version` value when it is present, non-blank and not the supported version
+     * (exact string match against {@see EnvelopeCodec::SCHEMA_VERSION}); null when the body may be decoded.
+     * Blank means the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`) — the
+     * same set in every SDK (GR-5); not `trim()`, whose default set contains `\0` and lacks `\f`.
+     */
+    private static function unsupportedSchemaVersion(mixed $value): ?string
+    {
+        if (! is_string($value) || preg_match('/\A[ \t\n\x0B\f\r]*\z/', $value) === 1) {
+            return null;
+        }
+
+        return $value === (string) EnvelopeCodec::SCHEMA_VERSION ? null : $value;
     }
 
     /**

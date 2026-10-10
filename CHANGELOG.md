@@ -17,6 +17,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
   in the consumer, so unlike the other SDKs the hook is not skipped for a non-conformant envelope.
 
 ### Fixed
+- `PulsarConsumer` now version-gates on `bq-schema-version` (broker-bindings §5.7 step 3). The property is read
+  before the body is decoded. A missing or blank value changes nothing; "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (`trim()` is not used: its default set contains `\0` and lacks `\f`.) any value other than
+  `EnvelopeCodec::SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ... exact string match) leaves the body undecoded and
+  returns a `PulsarMessage` whose routing URN is the reserved `PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . <value>`.
+  No handler owns it, so the `Dispatcher` takes its existing unknown-URN path (`on_unknown_urn`), and the error
+  names the rejected version. The message's envelope is `['raw' => <body>, 'attempts' => n]`, so a dead-letter
+  copy keeps the producer's bytes. The routing-mismatch hook is not called for a gated message. Also corrected the
+  `PulsarConsumer` docblock: the `Dispatcher` does not validate the envelope (there is no `accepts()` gate here).
+  The sentinel is an in-process marker only: the `Dispatcher` / `DeadLetterPublisher` write the record from the
+  raw body and never put the reserved URN on the wire, and a released (negatively acknowledged) message is
+  redelivered by the broker unchanged, so a redrive meets the same gate. Note: because the gate does not decode
+  the body, `meta.queue` is unknown, so a gated message's dead-letter record goes to `default.dlq` (the
+  `DeadLetterPublisher` fallback) instead of `<queue>.dlq`; watch `default.dlq` for these.
 - `PulsarConsumer` now follows broker-bindings §5.2/§5.7. `PulsarMessage::getUrn()` (what the
   `Dispatcher` routes on) is the `bq-job` message property, falling back to the body's URN when the
   property is absent or blank; `attempts` is the authoritative `bq-attempts` property (valid only as

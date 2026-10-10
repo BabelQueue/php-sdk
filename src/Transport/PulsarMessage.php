@@ -14,7 +14,9 @@ use BabelQueue\Contracts\HasRawBody;
  * and the §5-reconciled `attempts` counter (`max(bq-attempts or body.attempts, redeliveryCount)`),
  * so a handler can implement its own retry/dead-letter policy on poison messages. {@see getUrn()}
  * is the routing URN (the `bq-job` property when present, else the body's); {@see envelope()} is
- * always the body's envelope.
+ * always the body's envelope. For a delivery rejected by the §5.7 `bq-schema-version` gate the body
+ * is never decoded: the routing URN is {@see PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the
+ * rejected value and the envelope is only `['raw' => <body>, 'attempts' => n]`.
  */
 final class PulsarMessage implements ConsumedMessage, HasRawBody
 {

@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use BabelQueue\Consume\DeadLetterPublisher;
 use BabelQueue\Consume\Dispatcher;
+use BabelQueue\Contracts\Transport;
+use BabelQueue\Exceptions\UnknownUrnException;
 use BabelQueue\Transport\PulsarConsumer;
 use BabelQueue\Transport\PulsarMessage;
 use BabelQueue\Transport\PulsarWebSocketConsumerClient;
@@ -381,5 +384,124 @@ final class PulsarConsumerTest extends TestCase
         $message = $this->receiveWith($this->envelopeWith('urn:babel:orders:created', 5), []);
 
         $this->assertSame(5, $message->attempts());
+    }
+
+    // -- bq-schema-version gate (§5.7 step 3) --------------------------------
+
+    public function test_a_missing_or_blank_schema_version_decodes_normally(): void
+    {
+        // blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+        $blanks = ['', '  ', "\x0B", "\f", " \t\n\x0B\f\r"];
+        $cases = [[]];
+        foreach ($blanks as $blank) {
+            $cases[] = ['bq-schema-version' => $blank];
+        }
+
+        foreach ($cases as $properties) {
+            $message = $this->receiveWith(self::ENVELOPE, $properties);
+
+            $this->assertSame('urn:babel:orders:created', $message->getUrn());
+            $this->assertSame('urn:babel:orders:created', $message->envelope()['job']);
+        }
+    }
+
+    public function test_a_supported_schema_version_is_delivered(): void
+    {
+        $message = $this->receiveWith(self::ENVELOPE, ['bq-schema-version' => '1', 'bq-attempts' => '3']);
+
+        $this->assertSame('urn:babel:orders:created', $message->getUrn());
+        $this->assertSame(3, $message->attempts());
+    }
+
+    /** @return array<string, array{string}> */
+    public static function unsupportedSchemaVersions(): array
+    {
+        return ['2' => ['2'], 'non-numeric' => ['x'], 'leading zero' => ['01'], 'padded' => [' 1'], 'decimal' => ['1.0'], 'negative' => ['-1'],
+            // not ASCII whitespace, hence not blank
+            'nbsp' => ["\u{00A0}"], 'U+001C' => ["\u{001C}"], 'U+0085' => ["\u{0085}"], 'BOM' => ["\u{FEFF}"], 'ideographic space' => ["\u{3000}"], 'NUL' => ["\0"]];
+    }
+
+    #[DataProvider('unsupportedSchemaVersions')]
+    public function test_an_unsupported_schema_version_is_gated_before_decode(string $value): void
+    {
+        // The body is not JSON: had it been decoded the routing URN would be empty (and the envelope
+        // empty). The sentinel URN and the untouched raw body prove the gate ran first.
+        $garbage = '{not json';
+
+        $message = $this->receiveWith($garbage, ['bq-schema-version' => $value, 'bq-job' => 'urn:babel:orders:created'], 2);
+
+        $this->assertSame(PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . $value, $message->getUrn());
+        $this->assertSame($garbage, $message->rawBody());
+        $this->assertSame(['raw' => $garbage, 'attempts' => 2], $message->envelope());
+        $this->assertSame(2, $message->attempts());
+        $this->assertSame('mid-1', $message->messageId());
+    }
+
+    public function test_a_gated_message_does_not_call_the_routing_mismatch_hook(): void
+    {
+        $calls = 0;
+        $this->receiveWith(
+            $this->envelopeWith('urn:babel:orders:refunded'),
+            ['bq-schema-version' => '2', 'bq-job' => 'urn:babel:orders:created'],
+            0,
+            function () use (&$calls): void {
+                $calls++;
+            },
+        );
+
+        $this->assertSame(0, $calls);
+    }
+
+    public function test_a_gated_message_never_reaches_a_handler_and_releases_via_the_unknown_urn_path(): void
+    {
+        $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            $this->raw('{not json', 0, ['bq-schema-version' => '2', 'bq-job' => 'urn:babel:orders:created']),
+        );
+        $client->shouldReceive('negativeAcknowledge')->once()->with('mid-1');
+        $client->shouldReceive('acknowledge')->never();
+
+        $handled = false;
+        $dispatcher = (new Dispatcher())->on('urn:babel:orders:created', function () use (&$handled): void {
+            $handled = true;
+        });
+
+        $calls = 0;
+        (new PulsarConsumer($client))->consume(function (PulsarMessage $m) use ($dispatcher): void {
+            try {
+                $dispatcher($m);
+            } catch (UnknownUrnException $e) {
+                $this->assertStringContainsString('babelqueue:unsupported-schema-version:2', $e->getMessage());
+
+                throw $e; // consume() releases on a throwing handler
+            }
+        }, function () use (&$calls): bool {
+            return $calls++ >= 1;
+        });
+
+        $this->assertFalse($handled);
+    }
+
+    public function test_a_gated_message_is_dead_lettered_with_its_original_bytes(): void
+    {
+        $body = $this->envelopeWith('urn:babel:orders:created');
+        $message = $this->receiveWith($body, ['bq-schema-version' => 'x']);
+
+        $published = [];
+        $transport = Mockery::mock(Transport::class);
+        $transport->shouldReceive('publish')->once()->andReturnUsing(function (string $payload, string $queue) use (&$published): void {
+            $published = [json_decode($payload, true), $queue, $payload];
+        });
+
+        (new Dispatcher('dead_letter', 0, new DeadLetterPublisher($transport)))($message);
+
+        $this->assertSame($body, $published[0]['raw']);
+        $this->assertSame('unknown_urn', $published[0]['dead_letter']['reason']);
+        // The sentinel URN is an in-process marker: the dead-letter record never carries it.
+        $this->assertStringNotContainsString('"job":"babelqueue:unsupported-schema-version', $published[2]);
+        $this->assertArrayNotHasKey('job', $published[0]);
+        // The gate does not decode the body, so `meta.queue` is unknown and the record goes to the
+        // default dead-letter queue rather than `<queue>.dlq` (documented in the CHANGELOG).
+        $this->assertSame('default.dlq', $published[1]);
     }
 }
