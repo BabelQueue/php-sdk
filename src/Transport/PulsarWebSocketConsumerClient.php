@@ -14,8 +14,9 @@ namespace BabelQueue\Transport;
  * (`ws://<host>/ws/v2/consumer/persistent/<tenant>/<namespace>/<topic>/<subscription>`),
  * **base64-decodes** the frame's `payload` back to the canonical envelope JSON, and sends the ack
  * frames (`{"messageId": …}` to acknowledge, `{"messageId": …, "type": "negativeAcknowledge"}`
- * to redeliver). `redeliveryCount` is read from the frame so the consumer can reconcile §5
- * attempts (`max(body.attempts, redeliveryCount)`).
+ * to redeliver). The frame's `properties` (`bq-job`, `bq-attempts`) and `redeliveryCount` are
+ * surfaced so the consumer can route on `bq-job` and reconcile §5 attempts
+ * (`max(bq-attempts or body.attempts, redeliveryCount)`).
  */
 interface PulsarWebSocketConsumerClient
 {

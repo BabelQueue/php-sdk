@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `PulsarConsumer` takes an optional `$onRoutingMismatch` callable (`fn(string $propertyUrn, string $bodyUrn, array $envelope)`),
+  called when the `bq-job` property and the body URN differ. It is a separate diagnostic hook (default: none);
+  an exception it throws is swallowed and never changes the acknowledge / redeliver flow. It runs after the
+  `attempts` reconcile (the envelope it receives carries the reconciled value). PHP has no `accepts()` gate
+  in the consumer, so unlike the other SDKs the hook is not skipped for a non-conformant envelope.
+
+### Fixed
+- `PulsarConsumer` now follows broker-bindings §5.2/§5.7. `PulsarMessage::getUrn()` (what the
+  `Dispatcher` routes on) is the `bq-job` message property, falling back to the body's URN when the
+  property is absent or blank; `attempts` is the authoritative `bq-attempts` property (valid only as
+  `^[0-9]+$` within int32), falling back to the body when it is absent or invalid, then floored with
+  the 0-based `redeliveryCount`. Previously it routed on the body URN and ignored `bq-attempts`. The
+  envelope handed to handlers is still the decoded body, and a body without a `job` is never routed.
+  `PulsarMessage` gained an optional trailing `$routedUrn` constructor argument. No version bump;
+  envelope unchanged (`schema_version: 1`).
+
 ## [1.17.0] - 2026-10-03
 
 MINOR: new public API (warning sinks, `HasRawBody`, the `FORBIDDEN_*`

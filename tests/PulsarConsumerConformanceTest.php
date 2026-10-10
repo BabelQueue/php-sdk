@@ -12,7 +12,7 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * Apache Pulsar (§5) consume-side conformance: the `pulsar` block's `attempts_reconciliation`
- * cases. The PHP consumer reconciles `attempts = max(body.attempts, redeliveryCount)` on receive,
+ * cases. The PHP consumer reconciles `attempts` (bq-attempts, else body, floored by redeliveryCount) on receive,
  * matching the native-consumer SDKs (.NET/Java/Node) and the Transport+App SDKs (Python/Go).
  */
 final class PulsarConsumerConformanceTest extends TestCase
