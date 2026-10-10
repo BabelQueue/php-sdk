@@ -9,9 +9,10 @@ use BabelQueue\Codec\EnvelopeCodec;
 /**
  * The §6.4 **re-injection** consumer — the second half of PHP's Kafka retry-topic machinery, the
  * counterpart to {@see KafkaRetryRouter} (which routes a failure onto a tiered delay topic). It
- * reads `<workTopic>.retry.<delayMs>` records, **waits the tier delay** (cooperatively — there is no
- * broker timer), then **re-injects** each record into its original work topic (`bq-original-topic`)
- * and commits, so the work-topic worker re-processes it after the backoff.
+ * reads `<workTopic>.retry.<n>` records (`n` = 1-based tier index, e.g. `orders.retry.1`), **waits
+ * the tier delay** (cooperatively — there is no broker timer), then **re-injects** each record
+ * into its original work topic (`bq-original-topic`) and commits, so the work-topic worker
+ * re-processes it after the backoff.
  *
  * **Cooperative wait (§6.4):** a single blocking sleep longer than `max.poll.interval.ms` would
  * evict the consumer from its group (a rebalance, re-delivering the record). So the wait loops a

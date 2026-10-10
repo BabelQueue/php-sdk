@@ -14,10 +14,10 @@ use RuntimeException;
 
 /**
  * The §6.4/§6.5 retry-topic router: a failed work-topic record is republished to the next tiered
- * delay topic `<workTopic>.retry.<delayMs>` with `bq-attempts` incremented (and `bq-delay` /
- * `bq-original-topic` re-injection headers), or — once attempts are exhausted — dead-lettered to
- * `<workTopic>.dlq` with the additive `dead_letter` block. Decoupled from `ext-rdkafka` behind the
- * KafkaProducer seam.
+ * delay topic `<workTopic>.retry.<n>` (1-based tier index) with `bq-attempts` incremented (and
+ * `bq-delay` / `bq-original-topic` re-injection headers), or — once attempts are exhausted —
+ * dead-lettered to `<workTopic>.dlq` with the additive `dead_letter` block. Decoupled from
+ * `ext-rdkafka` behind the KafkaProducer seam.
  */
 final class KafkaRetryRouterTest extends TestCase
 {
@@ -45,7 +45,7 @@ final class KafkaRetryRouterTest extends TestCase
         $captured = [];
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'orders.retry.5000',
+            'orders.retry.1',
             Mockery::on(function (string $payload) use (&$captured): bool {
                 $captured['payload'] = $payload;
 
@@ -81,11 +81,11 @@ final class KafkaRetryRouterTest extends TestCase
 
     public function test_picks_the_tier_for_the_next_attempt(): void
     {
-        // attempts 1 → next 2 → tier index min(2-1, 3) = 1 → 30000.
+        // attempts 1 → next 2 → tier index min(2-1, 3) = 1 → topic .retry.2, delay 30000.
         $captured = [];
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'orders.retry.30000',
+            'orders.retry.2',
             Mockery::any(),
             Mockery::on(function (array $headers) use (&$captured): bool {
                 $captured['headers'] = $headers;
@@ -103,11 +103,11 @@ final class KafkaRetryRouterTest extends TestCase
 
     public function test_clamps_to_the_largest_tier_past_the_last_index(): void
     {
-        // tiers [1000, 3000]; attempts 5 → next 6 → index min(6-1, 1) = 1 → 3000.
+        // tiers [1000, 3000]; attempts 5 → next 6 → index min(6-1, 1) = 1 → topic .retry.2 (pinned), delay 3000.
         $captured = [];
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'orders.retry.3000',
+            'orders.retry.2',
             Mockery::any(),
             Mockery::on(function (array $headers) use (&$captured): bool {
                 $captured['headers'] = $headers;
@@ -170,7 +170,7 @@ final class KafkaRetryRouterTest extends TestCase
         // (with the prefix already baked in), not to <prefix><meta.queue>.
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'app.orders.retry.5000',
+            'app.orders.retry.1',
             Mockery::any(),
             Mockery::on(function (array $headers): bool {
                 return $headers['bq-original-topic'] === 'app.orders';
@@ -189,7 +189,7 @@ final class KafkaRetryRouterTest extends TestCase
     {
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'app.orders.retry.5000',
+            'app.orders.retry.1',
             Mockery::any(),
             Mockery::on(function (array $headers): bool {
                 return $headers['bq-original-topic'] === 'app.orders';
@@ -206,7 +206,7 @@ final class KafkaRetryRouterTest extends TestCase
     {
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'default.retry.5000',
+            'default.retry.1',
             Mockery::any(),
             Mockery::any(),
             Mockery::type('int'),
@@ -221,7 +221,7 @@ final class KafkaRetryRouterTest extends TestCase
     {
         $producer = Mockery::mock(KafkaProducer::class);
         $producer->shouldReceive('produce')->once()->with(
-            'orders-retry-2500',
+            'orders-retry-1',
             Mockery::any(),
             Mockery::on(function (array $headers): bool {
                 return $headers['bq-delay'] === '2500';
@@ -232,5 +232,49 @@ final class KafkaRetryRouterTest extends TestCase
         (new KafkaRetryRouter($producer, [2500], 5, '-retry-', '-dead'))->route($this->message());
 
         $this->addToAssertionCount(1);
+    }
+
+    public function test_walks_every_tier_with_one_based_topic_names_and_pins_to_the_last(): void
+    {
+        $seen = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->times(6)->andReturnUsing(
+            function (string $topic, string $payload, array $headers) use (&$seen): void {
+                $seen[] = [$topic, $headers['bq-delay']];
+            },
+        );
+
+        // maxAttempts high so none dead-letter; attempts 0..5 → next 1..6 over 4 default tiers.
+        $router = new KafkaRetryRouter($producer, maxAttempts: 100);
+        for ($attempts = 0; $attempts <= 5; $attempts++) {
+            $router->route($this->message(['attempts' => $attempts]));
+        }
+
+        $this->assertSame([
+            ['orders.retry.1', '5000'],
+            ['orders.retry.2', '30000'],
+            ['orders.retry.3', '300000'],
+            ['orders.retry.4', '1800000'],
+            ['orders.retry.4', '1800000'],
+            ['orders.retry.4', '1800000'],
+        ], $seen);
+    }
+
+    public function test_sorts_unordered_tiers_so_retry_index_follows_ascending_delay(): void
+    {
+        $seen = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->twice()->andReturnUsing(
+            function (string $topic, string $payload, array $headers) use (&$seen): void {
+                $seen[] = [$topic, $headers['bq-delay']];
+            },
+        );
+
+        // [30000, 5000] must behave exactly like [5000, 30000] (as in Java/.NET/Node).
+        $router = new KafkaRetryRouter($producer, [30000, 5000]);
+        $router->route($this->message(['attempts' => 0]));
+        $router->route($this->message(['attempts' => 1]));
+
+        $this->assertSame([['orders.retry.1', '5000'], ['orders.retry.2', '30000']], $seen);
     }
 }

@@ -38,6 +38,26 @@ The envelope wire format is versioned separately by `meta.schema_version`
   envelope handed to handlers is still the decoded body, and a body without a `job` is never routed.
   `PulsarMessage` gained an optional trailing `$routedUrn` constructor argument. No version bump;
   envelope unchanged (`schema_version: 1`).
+- `KafkaRetryRouter` now publishes retry records to `<workTopic>.retry.<n>`, where
+  `n` is the 1-based tier index in ascending-delay order (`orders.retry.1`,
+  `orders.retry.2`, ...), as broker-bindings.md §6.4/§6.5 specify and as the
+  Java/.NET/Node SDKs already do. Previously it used the delay in ms
+  (`orders.retry.5000`). The `bq-delay` header (tier delay in ms) is unchanged.
+
+- `KafkaRetryRouter` sorts `delayTiersMs` ascending on construction, so
+  `<workTopic>.retry.<n>` always maps to the n-th smallest delay (as in the
+  Java/.NET/Node SDKs), regardless of the order the tiers were passed in.
+
+### Migration
+This changes the retry topic names, so it is a behaviour change for operators.
+Roll it out in this order so neither the old nor the new topics are left unread:
+1. Create the new `<workTopic>.retry.1` ... `<workTopic>.retry.N` topics (one per
+   delay tier, ascending).
+2. Subscribe the `KafkaRetryConsumer` to both the old `<workTopic>.retry.<delayMs>`
+   topics and the new ones.
+3. Upgrade the router (producers of retry records).
+4. Once the old `.retry.<delayMs>` topics are drained, unsubscribe the consumer
+   from them and delete them.
 
 ## [1.17.0] - 2026-10-03
 
