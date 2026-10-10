@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\PolyglotJob;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -14,7 +15,11 @@ use PHPUnit\Framework\TestCase;
  * conservative broker round-trip. Pure CPU — no broker — so the gate is stable and
  * environment-independent in CI. The same methodology + reference is used by every
  * SDK's equivalent benchmark.
+ *
+ * Grouped as `benchmark` so the coverage job (PCOV instrumentation inflates wall-clock
+ * timings) excludes it; the uninstrumented PHP matrix jobs still enforce the budget.
  */
+#[Group('benchmark')]
 final class OverheadBenchmarkTest extends TestCase
 {
     /**
