@@ -9,6 +9,25 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+MINOR (when released): new public API (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`, `KafkaMessage` `$routedUrn`)
+alongside the fix below. The envelope stays at `schema_version: 1`.
+
+### Added
+- `KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX` (`babelqueue:unsupported-schema-version:`), the reserved routing URN
+  prefix of a record rejected by the schema-version gate (same shape as `PulsarConsumer`).
+- `KafkaMessage` takes an optional trailing `$routedUrn` constructor argument (the URN the `Dispatcher` routes on;
+  same shape as `PulsarMessage`). Additive; existing callers are unaffected.
+
+### Fixed
+- **`KafkaConsumer` now applies the `bq-schema-version` gate (broker-bindings §6.3 / §6.7).** The header was
+  never read, so a record carrying an unsupported version was decoded and routed. The header is now read
+  **before** the body is decoded: missing or blank (empty / ASCII whitespace only; not `trim()`) takes the
+  normal path, any other value that is not exactly `"1"` is rejected without decoding. A rejected record is
+  delivered as a `KafkaMessage` routed on `babelqueue:unsupported-schema-version:<value>`, mirroring
+  `PulsarConsumer`: the `Dispatcher` takes its unknown-URN path, never a handler, and the dead-letter copy keeps
+  the original bytes.
+- The Kafka and Pulsar conformance tests now run the vendored `schema_version_gate` tables.
+
 ## [1.18.0] - 2026-10-10
 
 MINOR: new public API (`PulsarConsumer` `$onRoutingMismatch` hook) alongside the fixes below. The envelope stays at

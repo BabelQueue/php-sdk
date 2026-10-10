@@ -22,6 +22,10 @@ use BabelQueue\Contracts\HasRawBody;
  * surfaces those record headers via {@see HasHeaders}, it is the consume-side hook through which a
  * carried W3C `traceparent` would reach {@see \BabelQueue\Otel\Tracing::wrap()} once a Kafka
  * producer injects one (ADR-0028; the Kafka producer-side wiring is a documented follow-up).
+ *
+ * For a record rejected by the §6.7 `bq-schema-version` gate the body is never decoded: the routing
+ * URN is {@see KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the rejected value and the envelope
+ * is only `['raw' => <body>, 'attempts' => n]`.
  */
 final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody
 {
@@ -29,17 +33,19 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
      * @param  array<string, string>  $headers  the raw §6 `bq-` record headers (UTF-8 strings)
      * @param  string|null  $rawBody  the record value as received (kept for poison dead-lettering)
+     * @param  string|null  $routedUrn  the URN to route on instead of the body's (the version-gate sentinel), or null
      */
     public function __construct(
         private readonly array $envelope,
         private readonly array $headers = [],
         private readonly ?string $rawBody = null,
+        private readonly ?string $routedUrn = null,
     ) {
     }
 
     public function getUrn(): string
     {
-        return EnvelopeCodec::urn($this->envelope);
+        return $this->routedUrn ?? EnvelopeCodec::urn($this->envelope);
     }
 
     public function getTraceId(): string

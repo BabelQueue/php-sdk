@@ -51,4 +51,43 @@ final class KafkaConsumerConformanceTest extends TestCase
             $this->assertSame($case['expected_attempts'], $message->attempts(), $case['name']);
         }
     }
+
+    /**
+     * §6.7 consumer-side schema-version gate: the manifest's `kafka.schema_version_gate` cases. The
+     * body is always the valid fixture envelope, so a `reject` verdict can only come from the header
+     * gate (the body is left undecoded and the routing URN is the reserved sentinel).
+     */
+    public function test_schema_version_gate_matches_the_golden_cases(): void
+    {
+        $manifest = json_decode(
+            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
+            true,
+            512,
+            JSON_THROW_ON_ERROR,
+        );
+        $gate = $manifest['kafka']['schema_version_gate'];
+        $body = (string) file_get_contents(__DIR__ . '/conformance/' . $gate['fixture']);
+        $fixtureUrn = (string) json_decode($body, true, 512, JSON_THROW_ON_ERROR)['job'];
+
+        foreach ($gate['cases'] as $case) {
+            $absent = ($case['absent'] ?? false) === true;
+            $headers = $absent ? [] : [$gate['property'] => (string) $case['value']];
+            $label = $absent ? 'absent' : bin2hex((string) $case['value']);
+
+            $client = Mockery::mock(KafkaConsumerClient::class);
+            $client->shouldReceive('receive')->once()->andReturn(['payload' => $body, 'headers' => $headers]);
+
+            $message = (new KafkaConsumer($client))->receive();
+
+            $this->assertNotNull($message, $label);
+            if ($case['expect'] === 'decode') {
+                $this->assertSame($fixtureUrn, $message->getUrn(), $label);
+                $this->assertArrayHasKey('job', $message->envelope(), $label);
+            } else {
+                $this->assertSame(KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . $case['value'], $message->getUrn(), $label);
+                $this->assertSame($body, $message->envelope()['raw'], $label);
+                $this->assertArrayNotHasKey('job', $message->envelope(), $label);
+            }
+        }
+    }
 }

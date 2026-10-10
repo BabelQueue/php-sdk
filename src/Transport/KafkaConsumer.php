@@ -29,9 +29,24 @@ use Throwable;
  * ({@see EnvelopeCodec::urn()}). The §6.4/§6.5 retry-topic delay/backoff + DLQ tier is the
  * {@see KafkaRetryRouter} (route a failure to `<topic>.retry.<n>` / `<topic>.dlq`) plus the
  * {@see KafkaRetryConsumer} (wait the tier delay, re-inject into the work topic).
+ *
+ * **Version gate (§6.7).** Before the body is decoded the `bq-schema-version` record header is read.
+ * A missing or blank value (empty or only ASCII whitespace) changes nothing; any value other than
+ * {@see EnvelopeCodec::SCHEMA_VERSION} (`"2"`, `"x"`, `"01"`, ...; exact string match) leaves the body
+ * undecoded and yields a message whose routing URN is the reserved
+ * {@see self::UNSUPPORTED_SCHEMA_URN_PREFIX}`<value>`. No handler owns it, so the Dispatcher takes its
+ * existing unknown-URN path (`on_unknown_urn`: dead-letter / ...), and the error names the rejected
+ * version. The envelope of such a message is only `['raw' => <body>, 'attempts' => n]`, so a
+ * dead-letter copy keeps the producer's bytes in the same `{"raw": ...}` shape as a poison body.
  */
 final class KafkaConsumer
 {
+    /**
+     * Reserved routing URN prefix for a record rejected by the §6.7 version gate; the rejected
+     * `bq-schema-version` value is appended. No handler is ever registered for it.
+     */
+    public const UNSUPPORTED_SCHEMA_URN_PREFIX = 'babelqueue:unsupported-schema-version:';
+
     public function __construct(
         private readonly KafkaConsumerClient $client,
     ) {
@@ -50,6 +65,22 @@ final class KafkaConsumer
             return null;
         }
 
+        // §6.7: gate on bq-schema-version before the body is decoded.
+        $rejectedVersion = self::unsupportedSchemaVersion($raw['headers']['bq-schema-version'] ?? null);
+        if ($rejectedVersion !== null) {
+            $rejectedAttempts = $raw['headers']['bq-attempts'] ?? null;
+
+            return new KafkaMessage(
+                [
+                    'raw' => $raw['payload'],
+                    'attempts' => is_string($rejectedAttempts) && $rejectedAttempts !== '' ? (int) $rejectedAttempts : 0,
+                ],
+                $raw['headers'],
+                $raw['payload'],
+                self::UNSUPPORTED_SCHEMA_URN_PREFIX . $rejectedVersion,
+            );
+        }
+
         $envelope = EnvelopeCodec::decode($raw['payload']);
 
         // §6: the bq-attempts header is authoritative (Kafka has no native delivery count); fall
@@ -62,6 +93,28 @@ final class KafkaConsumer
         // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
         // record's original work topic (bq-original-topic) across hops.
         return new KafkaMessage($envelope, $raw['headers'], $raw['payload']);
+    }
+
+    /**
+     * The `bq-schema-version` value when it is present, non-blank and not the supported version
+     * (exact string match against {@see EnvelopeCodec::SCHEMA_VERSION}); null when the body may be decoded.
+     */
+    private static function unsupportedSchemaVersion(mixed $value): ?string
+    {
+        if (! is_string($value) || self::isBlankASCII($value)) {
+            return null;
+        }
+
+        return $value === (string) EnvelopeCodec::SCHEMA_VERSION ? null : $value;
+    }
+
+    /**
+     * Blank means the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`) — the
+     * same set in every SDK (GR-5); not `trim()`, whose default set contains `\0` and lacks `\f`.
+     */
+    private static function isBlankASCII(string $value): bool
+    {
+        return preg_match('/\A[ \t\n\x0B\f\r]*\z/', $value) === 1;
     }
 
     /**

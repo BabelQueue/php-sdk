@@ -305,6 +305,15 @@ replay-bypass marker, ADR-0027). Which reference transports carry it:
 
 A plain `publish()` (no tracer) is unchanged on every transport.
 
+## Consumer schema-version gate (broker-bindings §5.7 / §6.7)
+
+`KafkaConsumer` and `PulsarConsumer` read the `bq-schema-version` header / property **before** decoding the
+body. A missing or blank value (empty, or only ASCII whitespace; not `trim()`, so NBSP, U+3000 and similar are
+*not* blank) takes the normal decode path. Any other value is compared as-is (no trimming) to `"1"`; anything
+else is rejected without decoding. A rejected record reaches the `Dispatcher` as a message routed on
+`babelqueue:unsupported-schema-version:<value>` (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`), so it takes the
+unknown-URN path (never a handler) and its dead-letter copy keeps the original bytes.
+
 ## Design
 
 This core is the **contract runtime**, not a worker. It does not own a broker
