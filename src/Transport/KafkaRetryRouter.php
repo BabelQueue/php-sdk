@@ -72,7 +72,7 @@ final class KafkaRetryRouter
         private readonly string $topicPrefix = '',
     ) {
         sort($delayTiersMs);
-        $this->delayTiersMs = array_values($delayTiersMs);
+        $this->delayTiersMs = $delayTiersMs;
     }
 
     /**
