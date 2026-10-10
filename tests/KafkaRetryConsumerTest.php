@@ -13,7 +13,7 @@ use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The §6.4 re-injection consumer: it reads a `<workTopic>.retry.<delayMs>` record, waits the
+ * The §6.4 re-injection consumer: it reads a `<workTopic>.retry.<n>` record, waits the
  * `bq-delay` tier cooperatively (heartbeating the seam to keep group membership during a wait that
  * could exceed `max.poll.interval.ms`), then re-injects the decoded envelope into `bq-original-topic`
  * and commits. `bq-attempts` is NOT re-incremented (the router already bumped it). The wait is driven

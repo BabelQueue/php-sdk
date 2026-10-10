@@ -27,7 +27,7 @@ use Throwable;
  * {@see \BabelQueue\Consume\Dispatcher} runtime (or a framework adapter): it is callable, so
  * `consume($dispatcher, $shouldStop)` routes on `bq-job` via the body's `job` URN
  * ({@see EnvelopeCodec::urn()}). The §6.4/§6.5 retry-topic delay/backoff + DLQ tier is the
- * {@see KafkaRetryRouter} (route a failure to `<topic>.retry.<delayMs>` / `<topic>.dlq`) plus the
+ * {@see KafkaRetryRouter} (route a failure to `<topic>.retry.<n>` / `<topic>.dlq`) plus the
  * {@see KafkaRetryConsumer} (wait the tier delay, re-inject into the work topic).
  */
 final class KafkaConsumer
