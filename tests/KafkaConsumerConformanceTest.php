@@ -71,8 +71,9 @@ final class KafkaConsumerConformanceTest extends TestCase
 
         foreach ($gate['cases'] as $case) {
             $absent = ($case['absent'] ?? false) === true;
-            $headers = $absent ? [] : [$gate['property'] => (string) $case['value']];
-            $label = $absent ? 'absent' : bin2hex((string) $case['value']);
+            // A JSON null value is a header present with a null value, which §6.7 treats as absent.
+            $headers = $absent ? [] : [$gate['property'] => $case['value'] === null ? null : (string) $case['value']];
+            $label = $absent ? 'absent' : ($case['value'] === null ? 'null' : bin2hex((string) $case['value']));
 
             $client = Mockery::mock(KafkaConsumerClient::class);
             $client->shouldReceive('receive')->once()->andReturn(['payload' => $body, 'headers' => $headers]);
