@@ -60,6 +60,12 @@ final class Redrive
      * (skipped, dry-run, undecodable) are never re-encountered in the same run. A DLQ message is
      * acknowledged only after its re-publish succeeds; an undecodable body is restored, not
      * dropped. On a publish failure the message is restored to the DLQ and the error re-thrown.
+     *
+     * Whatever stops the run (a failed write, a failed restore, a throwing select, a failed ack), an IO
+     * implementing {@see RewindingRedriveIO} is asked to hand back every reserved, unacknowledged message,
+     * the rest of the batch included. When several steps failed (publish, restore, rewind) the errors are
+     * thrown together as one {@see RedriveRecoveryFailed}; a lone error is thrown as is, and an IO without
+     * rewind rethrows the restore error as it always did.
      */
     public static function run(RedriveIO $io, string $dlq, ?RedriveOptions $options = null): RedriveResult
     {
@@ -88,57 +94,114 @@ final class Redrive
         $items = [];
 
         foreach ($batch as $p) {
-            if (! $p['decoded']) {
-                self::republishFrom($io, $dlq, $p['body'], $p['key']); // restore the poison body; never drop it
-                $io->ack($p['handle']);
-                $skipped++;
-                $items[] = new RedriveItem('', '', '', '', $dlq, '', false);
-
-                continue;
-            }
-
-            $env = $p['env'];
-            $messageId = self::metaString($env, 'id');
-            $traceId = self::stringField($env, 'trace_id');
-            $urn = EnvelopeCodec::urn($env);
-            $reason = self::deadLetterString($env, 'reason');
-
-            $select = $options->select;
-            if ($select !== null && ! $select($env)) {
-                self::republishFrom($io, $dlq, $p['body'], $p['key']); // not selected: restore unchanged
-                $io->ack($p['handle']);
-                $skipped++;
-                $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, '', false);
-
-                continue;
-            }
-
-            $target = $options->toQueue ?? self::sourceQueueOf($env);
-
-            if ($options->dryRun) {
-                self::republishFrom($io, $dlq, $p['body'], $p['key']); // report the plan; restore unchanged
-                $io->ack($p['handle']);
-                $skipped++;
-                $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, false);
-
-                continue;
-            }
-
-            $body = EnvelopeCodec::encode(self::reset($env));
             try {
-                $bypassed = self::publishRedriven($io, $target, $body, $options->bypass, $p['key']);
-            } catch (Throwable $e) {
-                self::republishFrom($io, $dlq, $p['body'], $p['key']); // restore on a publish failure, then surface it
-                $io->ack($p['handle']);
+                if (! $p['decoded']) {
+                    self::restore($io, $dlq, $p); // restore the poison body; never drop it
+                    $skipped++;
+                    $items[] = new RedriveItem('', '', '', '', $dlq, '', false);
 
-                throw $e;
+                    continue;
+                }
+
+                $env = $p['env'];
+                $messageId = self::metaString($env, 'id');
+                $traceId = self::stringField($env, 'trace_id');
+                $urn = EnvelopeCodec::urn($env);
+                $reason = self::deadLetterString($env, 'reason');
+
+                $select = $options->select;
+                if ($select !== null && ! $select($env)) {
+                    self::restore($io, $dlq, $p); // not selected: restore unchanged
+                    $skipped++;
+                    $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, '', false);
+
+                    continue;
+                }
+
+                $target = $options->toQueue ?? self::sourceQueueOf($env);
+
+                if ($options->dryRun) {
+                    self::restore($io, $dlq, $p); // report the plan; restore unchanged
+                    $skipped++;
+                    $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, false);
+
+                    continue;
+                }
+
+                $body = EnvelopeCodec::encode(self::reset($env));
+                try {
+                    $bypassed = self::publishRedriven($io, $target, $body, $options->bypass, $p['key']);
+                } catch (Throwable $e) {
+                    try {
+                        self::restore($io, $dlq, $p); // restore on a publish failure, then surface it
+                    } catch (Throwable $restoreFailure) {
+                        // Without a rewind capability the restore error is thrown as it always was; with one,
+                        // every error of the failed step is reported together, see handBack().
+                        throw $io instanceof RewindingRedriveIO
+                            ? new RedriveRecoveryFailed(
+                                'redrive: the publish and the restore failed: ' . $e->getMessage()
+                                . ' / ' . $restoreFailure->getMessage(),
+                                [$e, $restoreFailure],
+                            )
+                            : $restoreFailure;
+                    }
+
+                    throw $e;
+                }
+                $io->ack($p['handle']);
+                $redriven++;
+                $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, true, $bypassed);
+            } catch (Throwable $failure) {
+                // The run stops here, so the rest of the reserved batch would never be processed: hand it
+                // back whatever stopped it (a failed write, a failed restore, a throwing select, a failed ack).
+                throw self::handBack($io, $p['handle'], $failure);
             }
-            $io->ack($p['handle']);
-            $redriven++;
-            $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, true, $bypassed);
         }
 
         return new RedriveResult($redriven, $skipped, $items);
+    }
+
+    /**
+     * Called when $handle's message stopped the run with $failure: an IO implementing
+     * {@see RewindingRedriveIO} is asked to hand back every reserved, unacknowledged message (Kafka: seek
+     * back, so a later cumulative commit cannot skip any of them). $handle itself may already be
+     * acknowledged (a restored message after a failed redrive write) and is then not redelivered. Returns
+     * the throwable to throw: $failure untouched, or, when the rewind failed too, a
+     * {@see RedriveRecoveryFailed} carrying every error in one flat list.
+     */
+    private static function handBack(RedriveIO $io, mixed $handle, Throwable $failure): Throwable
+    {
+        if (! $io instanceof RewindingRedriveIO) {
+            return $failure;
+        }
+
+        try {
+            $io->rewind($handle);
+        } catch (Throwable $rewindError) {
+            $errors = $failure instanceof RedriveRecoveryFailed ? $failure->getErrors() : [$failure];
+            $errors[] = $rewindError;
+
+            return new RedriveRecoveryFailed(
+                'redrive: the run failed and the rewind failed too: ' . $failure->getMessage()
+                . ' / ' . $rewindError->getMessage(),
+                $errors,
+            );
+        }
+
+        return $failure;
+    }
+
+    /**
+     * Restore a reserved DLQ message to $dlq unchanged and acknowledge it. If the restore write fails the
+     * message is never acknowledged and the error is thrown ({@see run()} then hands the batch back to an
+     * IO implementing {@see RewindingRedriveIO}).
+     *
+     * @param  array{body: string, handle: mixed, key: string|null}  $p
+     */
+    private static function restore(RedriveIO $io, string $dlq, array $p): void
+    {
+        self::republishFrom($io, $dlq, $p['body'], $p['key']);
+        $io->ack($p['handle']);
     }
 
     /**

@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `Redrive\RewindingRedriveIO` — optional `RedriveIO` extension with `rewind(mixed $handle)` (the PHP mirror
+  of Go's `Rewinder`). Whatever stops a `Redrive::run()` (the restore write back to the DLQ failed, the redrive
+  write failed, the `select` predicate threw, the acknowledgement failed) the message that stopped it is
+  never acked by the failure path and the IO is asked to hand back every reserved, unacknowledged message
+  (Kafka: seek the consumer back, because an offset commit is cumulative and a later commit would otherwise
+  skip the records of the rest of the batch). The handle passed to `rewind()` may already be acknowledged
+  (restored after a failed redrive write) and must then not be redelivered. When several steps failed
+  (publish, restore, rewind), `Redrive\RedriveRecoveryFailed` carries every error in one flat list
+  (`getErrors()`); a lone error is thrown as is. A plain `RedriveIO` without `rewind` is unchanged, including
+  the exception thrown when a redrive write and its restore both fail (the restore error, as before).
+  No wire change.
+
 ## [1.21.0] - 2026-10-11
 
 ### Added
