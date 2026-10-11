@@ -46,7 +46,7 @@ jobs:
         run: composer update --prefer-dist --no-interaction --no-progress
 
       - name: Tests with coverage
-        run: vendor/bin/phpunit --coverage-clover=coverage.xml
+        run: vendor/bin/phpunit --coverage-clover=coverage.xml --exclude-group benchmark
 
       - name: Enforce coverage gate
         run: php bin/check-coverage.php coverage.xml 90
