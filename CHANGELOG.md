@@ -9,8 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-MINOR: new public API (`KeyedKafkaProducer`, `KeyedPublisher`, `HasRecordKey`, `KafkaMessage` `$key`).
-No tag; the envelope is unchanged (`schema_version: 1`).
+## [1.20.0] - 2026-10-11
+
+MINOR: new public API (`KeyedKafkaProducer`, `KeyedPublisher`, `HasRecordKey`, `KafkaMessage` `$key`); the envelope is unchanged (`schema_version: 1`).
 
 ### Added
 - `Transport\KeyedKafkaProducer` — optional `KafkaProducer` extension with `produceKeyed(..., ?string $key)`.
