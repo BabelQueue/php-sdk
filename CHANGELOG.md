@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-11
+
 ### Added
 - `Redrive\KeyedRedriveIO` — optional `RedriveIO` extension with `publishKeyed($queue, $body, ?string $key)`
   (the redrive-side mirror of `KeyedPublisher` / Go's `KeyedRepublisher`). `RedriveIO::pop()` may return an
