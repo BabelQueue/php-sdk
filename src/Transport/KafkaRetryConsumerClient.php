@@ -31,7 +31,11 @@ interface KafkaRetryConsumerClient
      * carry the §6 `bq-` record headers (UTF-8 strings) — `bq-delay` is the tier delay in ms to wait
      * and `bq-original-topic` is the work topic to re-inject into.
      *
-     * @return array{payload: string, headers: array<string, string>}|null
+     * The optional `key` is the record key bytes as received (omit it, or null, for a null key; an
+     * empty string is a real, empty key) — carried through the retry / dead-letter writes
+     * ({@see KeyedKafkaProducer}).
+     *
+     * @return array{payload: string, headers: array<string, string>, key?: string|null}|null
      */
     public function receive(): ?array;
 

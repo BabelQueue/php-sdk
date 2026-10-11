@@ -9,6 +9,24 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+MINOR: new public API (`KeyedKafkaProducer`, `KeyedPublisher`, `HasRecordKey`, `KafkaMessage` `$key`).
+No tag; the envelope is unchanged (`schema_version: 1`).
+
+### Added
+- `Transport\KeyedKafkaProducer` — optional `KafkaProducer` extension with `produceKeyed(..., ?string $key)`.
+  An `ext-rdkafka` adapter implements it to carry a record key on the SDK-owned writes; a producer that
+  does not keeps today's keyless behaviour.
+- `Contracts\KeyedPublisher` (`publishKeyed()`, implemented by `KafkaTransport`) and `Contracts\HasRecordKey`
+  (`recordKey()`, implemented by `KafkaMessage`).
+- `KafkaMessage` gained a trailing `?string $key = null` constructor argument; `KafkaConsumerClient` /
+  `KafkaRetryConsumerClient::receive()` may return an optional `key` entry.
+
+### Fixed
+- The original Kafka record key is now preserved (null stays null, empty stays empty, never synthesised)
+  on the retry-topic republish, the retry-to-work re-inject, the envelope DLQ and the raw (poison /
+  version-gate-rejected) DLQ, which previously dropped it. Partition equality is not guaranteed.
+  Requires a `KeyedKafkaProducer` producer; with a plain `KafkaProducer` the key is still dropped.
+
 ## [1.19.0] - 2026-10-10
 
 MINOR: new public API (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`, `KafkaMessage` `$routedUrn`)

@@ -7,6 +7,8 @@ namespace BabelQueue\Consume;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
 use BabelQueue\Contracts\HasRawBody;
+use BabelQueue\Contracts\HasRecordKey;
+use BabelQueue\Contracts\KeyedPublisher;
 use BabelQueue\Contracts\Transport;
 use BabelQueue\DeadLetter\DeadLetter;
 use Throwable;
@@ -42,6 +44,15 @@ final class DeadLetterPublisher
         $body = $poisonBody === null
             ? EnvelopeCodec::encode($annotated)
             : json_encode($annotated, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        // Carry the original broker record key (Kafka) onto the DLQ copy when there is one and the
+        // transport can take it; a null key, or a transport without the capability, publishes as before.
+        $key = $message instanceof HasRecordKey ? $message->recordKey() : null;
+        if ($key !== null && $this->transport instanceof KeyedPublisher) {
+            $this->transport->publishKeyed($body, $queue . $this->suffix, $key);
+
+            return;
+        }
 
         $this->transport->publish($body, $queue . $this->suffix);
     }

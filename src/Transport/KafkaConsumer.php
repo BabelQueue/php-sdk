@@ -78,6 +78,7 @@ final class KafkaConsumer
                 $raw['headers'],
                 $raw['payload'],
                 self::UNSUPPORTED_SCHEMA_URN_PREFIX . $rejectedVersion,
+                $raw['key'] ?? null,
             );
         }
 
@@ -92,7 +93,7 @@ final class KafkaConsumer
 
         // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
         // record's original work topic (bq-original-topic) across hops.
-        return new KafkaMessage($envelope, $raw['headers'], $raw['payload']);
+        return new KafkaMessage($envelope, $raw['headers'], $raw['payload'], null, $raw['key'] ?? null);
     }
 
     /**

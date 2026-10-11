@@ -27,6 +27,10 @@ use Throwable;
  * every retry hop** (GR-4). The envelope itself is unchanged (`schema_version` stays 1) — only the
  * `bq-attempts` counter and the body's top-level `attempts` advance.
  *
+ * The original record's **key** is carried onto the retry and DLQ records unchanged (null stays null,
+ * empty stays empty, never synthesised) when the producer is a {@see KeyedKafkaProducer}; otherwise
+ * the key is dropped as before. Partition equality is not guaranteed.
+ *
  * It is decoupled from `ext-rdkafka` behind the existing {@see KafkaProducer} seam, so it is
  * dependency-free and unit-tests against a fake.
  *
@@ -92,12 +96,12 @@ final class KafkaRetryRouter
         $nowMs = $this->nowMs();
 
         if ($next >= $this->maxAttempts) {
-            $this->deadLetter($envelope, $workTopic, $next, $e, $nowMs);
+            $this->deadLetter($envelope, $workTopic, $next, $e, $nowMs, $message->recordKey());
 
             return false;
         }
 
-        $this->retry($envelope, $workTopic, $next, $nowMs);
+        $this->retry($envelope, $workTopic, $next, $nowMs, $message->recordKey());
 
         return true;
     }
@@ -108,7 +112,7 @@ final class KafkaRetryRouter
      *
      * @param  array<string, mixed>  $envelope
      */
-    private function retry(array $envelope, string $workTopic, int $next, int $nowMs): void
+    private function retry(array $envelope, string $workTopic, int $next, int $nowMs, ?string $key): void
     {
         $tierIndex = $this->tierIndexForAttempt($next);
         $tierMs = $this->delayTiersMs[$tierIndex];
@@ -118,11 +122,13 @@ final class KafkaRetryRouter
         $headers['bq-delay'] = (string) $tierMs;
         $headers['bq-original-topic'] = $workTopic;
 
-        $this->producer->produce(
+        KafkaProduce::send(
+            $this->producer,
             $workTopic . $this->retryInfix . ($tierIndex + 1),
             EnvelopeCodec::encode($envelope),
             $headers,
             $nowMs,
+            $key,
         );
     }
 
@@ -131,16 +137,18 @@ final class KafkaRetryRouter
      *
      * @param  array<string, mixed>  $envelope
      */
-    private function deadLetter(array $envelope, string $workTopic, int $attempts, ?Throwable $e, int $nowMs): void
+    private function deadLetter(array $envelope, string $workTopic, int $attempts, ?Throwable $e, int $nowMs, ?string $key): void
     {
         $queue = $this->queue($envelope);
         $annotated = DeadLetter::annotate($envelope, 'failed', $e, $queue, $attempts);
 
-        $this->producer->produce(
+        KafkaProduce::send(
+            $this->producer,
             $workTopic . $this->dlqSuffix,
             EnvelopeCodec::encode($annotated),
             $this->headers($annotated, $attempts),
             $nowMs,
+            $key,
         );
     }
 

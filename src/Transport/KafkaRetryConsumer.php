@@ -84,7 +84,7 @@ final class KafkaRetryConsumer
             $headers = $raw['headers'];
 
             $this->waitDelay($this->delayMs($headers));
-            $this->reinject($raw['payload'], $headers);
+            $this->reinject($raw['payload'], $headers, $raw['key'] ?? null);
             $this->client->commit();
         }
     }
@@ -119,25 +119,30 @@ final class KafkaRetryConsumer
      * being re-encoded from the empty (poison) envelope, so the work-topic worker can still
      * dead-letter an inspectable copy rather than an empty one.
      *
+     * The retry record's key (the original work-topic record's key, carried by {@see KafkaRetryRouter})
+     * is re-injected unchanged when the producer is a {@see KeyedKafkaProducer}.
+     *
      * @param  array<string, string>  $headers
      */
-    private function reinject(string $payload, array $headers): void
+    private function reinject(string $payload, array $headers, ?string $key): void
     {
         $envelope = EnvelopeCodec::decode($payload);
         $workTopic = $this->originalTopic($headers, $envelope);
 
         if ($envelope === []) {
             unset($headers['bq-delay'], $headers['bq-original-topic']);
-            $this->producer->produce($workTopic, $payload, $headers, ($this->now)());
+            KafkaProduce::send($this->producer, $workTopic, $payload, $headers, ($this->now)(), $key);
 
             return;
         }
 
-        $this->producer->produce(
+        KafkaProduce::send(
+            $this->producer,
             $workTopic,
             EnvelopeCodec::encode($envelope),
             $this->headers($envelope),
             ($this->now)(),
+            $key,
         );
     }
 

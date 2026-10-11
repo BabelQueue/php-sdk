@@ -8,6 +8,7 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
 use BabelQueue\Contracts\HasHeaders;
 use BabelQueue\Contracts\HasRawBody;
+use BabelQueue\Contracts\HasRecordKey;
 
 /**
  * A record received by {@see KafkaConsumer} — the framework-agnostic, read-only view of the decoded
@@ -27,19 +28,21 @@ use BabelQueue\Contracts\HasRawBody;
  * URN is {@see KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the rejected value and the envelope
  * is only `['raw' => <body>, 'attempts' => n]`.
  */
-final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody
+final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody, HasRecordKey
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
      * @param  array<string, string>  $headers  the raw §6 `bq-` record headers (UTF-8 strings)
      * @param  string|null  $rawBody  the record value as received (kept for poison dead-lettering)
      * @param  string|null  $routedUrn  the URN to route on instead of the body's (the version-gate sentinel), or null
+     * @param  string|null  $key  the record key bytes as received (null = null key; '' = a real, empty key)
      */
     public function __construct(
         private readonly array $envelope,
         private readonly array $headers = [],
         private readonly ?string $rawBody = null,
         private readonly ?string $routedUrn = null,
+        private readonly ?string $key = null,
     ) {
     }
 
@@ -108,6 +111,16 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody
     public function envelope(): array
     {
         return $this->envelope;
+    }
+
+    /**
+     * The record key as received, or null when the record had a null key (an empty string is a
+     * real, empty key). Native broker metadata — not part of the envelope; the retry / re-inject /
+     * dead-letter writes carry it through unchanged ({@see KeyedKafkaProducer}).
+     */
+    public function recordKey(): ?string
+    {
+        return $this->key;
     }
 
     /**

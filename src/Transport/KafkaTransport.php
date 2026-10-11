@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\Transport;
+use BabelQueue\Contracts\KeyedPublisher;
 
 /**
  * A framework-less **Apache Kafka** producer — PHP's path to the §6 binding via the
@@ -24,10 +24,10 @@ use BabelQueue\Contracts\Transport;
  * here (Kafka), unlike the §7 Artemis `bq_` underscores. The envelope is unchanged
  * (`schema_version` stays 1); Apache Kafka is purely additive.
  *
- * This is a **producer** (the core {@see Transport} is publish-only, like the Redis/AMQP/SQS/STOMP
+ * This is a **producer** (the core {@see \BabelQueue\Contracts\Transport} is publish-only, like the Redis/AMQP/SQS/STOMP
  * transports); PHP consumes Kafka via a framework worker.
  */
-final class KafkaTransport implements Transport
+final class KafkaTransport implements KeyedPublisher
 {
     public function __construct(
         private readonly KafkaProducer $producer,
@@ -38,6 +38,15 @@ final class KafkaTransport implements Transport
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
+        return $this->publishKeyed($payload, $queue, null);
+    }
+
+    /**
+     * Publish with the original record key carried through ({@see KeyedPublisher}); a null key — or a
+     * producer that is not a {@see KeyedKafkaProducer} — is exactly {@see self::publish()}.
+     */
+    public function publishKeyed(string $payload, ?string $queue, ?string $key): ?string
+    {
         $target = $queue ?? $this->defaultTopic;
         // Decoded only to project the transport headers; the payload is published verbatim, so a
         // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
@@ -45,7 +54,7 @@ final class KafkaTransport implements Transport
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
 
         $timestamp = isset($meta['created_at']) && is_int($meta['created_at']) ? $meta['created_at'] : null;
-        $this->producer->produce($this->topicPrefix . $target, $payload, $this->headers($envelope), $timestamp);
+        KafkaProduce::send($this->producer, $this->topicPrefix . $target, $payload, $this->headers($envelope), $timestamp, $key);
 
         $id = $meta['id'] ?? null;
 
