@@ -9,6 +9,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `Redrive\KeyedRedriveIO` — optional `RedriveIO` extension with `publishKeyed($queue, $body, ?string $key)`
+  (the redrive-side mirror of `KeyedPublisher` / Go's `KeyedRepublisher`). `RedriveIO::pop()` may return an
+  optional `key` entry.
+
+### Fixed
+- DLQ redrive now carries the Kafka record key (contract §6.5 "Record key on republish"): when the
+  `RedriveIO` implements `KeyedRedriveIO`, the redrive write and every restore-to-DLQ write (dry-run, not
+  selected, undecodable, publish failure) reuse the DLQ record's key byte-for-byte — null stays null, empty
+  stays empty. A plain `RedriveIO` behaves exactly as before; the `bypass` header path carries no key.
+  No wire change.
+
 ## [1.20.0] - 2026-10-11
 
 MINOR: new public API (`KeyedKafkaProducer`, `KeyedPublisher`, `HasRecordKey`, `KafkaMessage` `$key`); the envelope is unchanged (`schema_version: 1`).

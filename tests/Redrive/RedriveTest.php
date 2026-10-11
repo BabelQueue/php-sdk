@@ -7,10 +7,12 @@ namespace BabelQueue\Tests\Redrive;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
 use BabelQueue\Redrive\HeaderRedriveIO;
+use BabelQueue\Redrive\KeyedRedriveIO;
 use BabelQueue\Redrive\Redrive;
 use BabelQueue\Redrive\RedriveIO;
 use BabelQueue\Redrive\RedriveOptions;
 use BabelQueue\Redrive\ReplayBypass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -85,6 +87,42 @@ final class HeaderFakeIO implements HeaderRedriveIO
     {
         $this->publish($queue, $body);
         $this->headers[$queue][] = $headers;
+    }
+}
+
+/**
+ * A key-capable {@see KeyedRedriveIO} (the Kafka shape): every queue entry is a `[body, key]` pair, `pop`
+ * surfaces the stored key through the optional `key` entry, and `publishKeyed` stores the key it was
+ * handed — so a test can assert the exact key (null vs empty vs bytes) each write carried.
+ */
+final class KeyedFakeIO implements KeyedRedriveIO
+{
+    /** @var array<string, list<array{0: string, 1: string|null}>> */
+    public array $queues = [];
+
+    public function pop(string $queue): ?array
+    {
+        if (empty($this->queues[$queue])) {
+            return null;
+        }
+        [$body, $key] = array_shift($this->queues[$queue]);
+
+        return ['body' => $body, 'handle' => null, 'key' => $key];
+    }
+
+    public function ack(mixed $handle): void
+    {
+        // no-op: pop already removed the message
+    }
+
+    public function publish(string $queue, string $body): void
+    {
+        $this->publishKeyed($queue, $body, null);
+    }
+
+    public function publishKeyed(string $queue, string $body, ?string $key): void
+    {
+        $this->queues[$queue][] = [$body, $key];
     }
 }
 
@@ -267,5 +305,124 @@ final class RedriveTest extends TestCase
         $this->assertFalse($res->items[0]->bypassed);
         $this->assertArrayNotHasKey('orders', $io->headers); // publishWithHeaders never called
         $this->assertCount(1, $io->queues['orders']);
+    }
+
+    /**
+     * @return array<string, array{0: string|null}>
+     */
+    public static function recordKeys(): array
+    {
+        return ['bytes' => ["order-1042"], 'empty' => [''], 'null' => [null], 'binary' => ["\x00\xff\x10"]];
+    }
+
+    #[DataProvider('recordKeys')]
+    public function testRedriveCarriesTheDlqRecordKeyByteForByte(?string $key): void
+    {
+        $io = new KeyedFakeIO();
+        $io->publishKeyed('orders.dlq', EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders')), $key);
+
+        $res = Redrive::run($io, 'orders.dlq');
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertCount(1, $io->queues['orders']);
+        $this->assertSame($key, $io->queues['orders'][0][1], 'null stays null, empty stays empty');
+    }
+
+    #[DataProvider('recordKeys')]
+    public function testRestoreToDlqKeepsTheKey(?string $key): void
+    {
+        $dead = EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders'));
+
+        // dry-run, not-selected and undecodable bodies are all restored to the DLQ with their key.
+        foreach ([new RedriveOptions(dryRun: true), new RedriveOptions(select: static fn (array $e): bool => false)] as $options) {
+            $io = new KeyedFakeIO();
+            $io->publishKeyed('orders.dlq', $dead, $key);
+            Redrive::run($io, 'orders.dlq', $options);
+            $this->assertSame([[$dead, $key]], $io->queues['orders.dlq']);
+        }
+
+        $io = new KeyedFakeIO();
+        $io->publishKeyed('orders.dlq', 'not json at all', $key);
+        Redrive::run($io, 'orders.dlq');
+        $this->assertSame([['not json at all', $key]], $io->queues['orders.dlq']);
+    }
+
+    public function testPublishFailureRestoresToDlqWithTheKey(): void
+    {
+        $keyed = new class () implements KeyedRedriveIO {
+            /** @var list<array{0: string, 1: string, 2: string|null}> */
+            public array $writes = [];
+            public ?array $next = null;
+
+            public function pop(string $queue): ?array
+            {
+                $n = $this->next;
+                $this->next = null;
+
+                return $n;
+            }
+
+            public function ack(mixed $handle): void
+            {
+            }
+
+            public function publish(string $queue, string $body): void
+            {
+                $this->publishKeyed($queue, $body, null);
+            }
+
+            public function publishKeyed(string $queue, string $body, ?string $key): void
+            {
+                if ($queue === 'orders') {
+                    throw new RuntimeException('publish refused');
+                }
+                $this->writes[] = [$queue, $body, $key];
+            }
+        };
+        $dead = EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders'));
+        $keyed->next = ['body' => $dead, 'handle' => null, 'key' => 'k-9'];
+
+        try {
+            Redrive::run($keyed, 'orders.dlq');
+            $this->fail('expected the publish failure to surface');
+        } catch (RuntimeException) {
+            $this->assertSame([['orders.dlq', $dead, 'k-9']], $keyed->writes);
+        }
+    }
+
+    public function testAPlainIoIgnoresAKeyEntryInPopAndRepublishesKeyless(): void
+    {
+        // A plain RedriveIO whose pop() happens to return a `key` entry: without KeyedRedriveIO the
+        // key is ignored and the message is republished through publish(), exactly as before.
+        $io = new class () implements RedriveIO {
+            /** @var list<array{0: string, 1: string}> */
+            public array $published = [];
+
+            /** @var list<string> */
+            public array $pending = [];
+
+            public function pop(string $queue): ?array
+            {
+                $body = array_shift($this->pending);
+
+                return $body === null ? null : ['body' => $body, 'handle' => null, 'key' => 'k-1'];
+            }
+
+            public function ack(mixed $handle): void
+            {
+            }
+
+            public function publish(string $queue, string $body): void
+            {
+                $this->published[] = [$queue, $body];
+            }
+        };
+        $io->pending[] = EnvelopeCodec::encode($this->deadLettered('urn:babel:orders:created', 'orders'));
+
+        $res = Redrive::run($io, 'orders.dlq');
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertCount(1, $io->published);
+        $this->assertSame('orders', $io->published[0][0]);
     }
 }

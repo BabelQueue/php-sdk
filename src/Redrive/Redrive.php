@@ -31,6 +31,11 @@ use Throwable;
  * marker rides out of band beside the frozen envelope (GR-1); a plain {@see RedriveIO} cannot carry
  * it, so `bypass` is a best-effort no-op there and the per-item `bypassed` flag stays false — the
  * exact best-effort contract Go's `Redrive` uses against its `HeaderPublisher` check (ADR-0027).
+ *
+ * **Record key (Kafka, contract §6.5):** when the {@see RedriveIO} also implements
+ * {@see KeyedRedriveIO}, the DLQ record's key (surfaced by `pop()`'s optional `key` entry) is carried
+ * byte-for-byte onto the redriven record and onto every restore-to-DLQ write — null stays null, empty
+ * stays empty. The bypass-header path carries no key (as in the Go reference).
  */
 final class Redrive
 {
@@ -60,7 +65,7 @@ final class Redrive
     {
         $options ??= new RedriveOptions();
 
-        /** @var list<array{body: string, handle: mixed, env: array<string, mixed>, decoded: bool}> $batch */
+        /** @var list<array{body: string, handle: mixed, key: string|null, env: array<string, mixed>, decoded: bool}> $batch */
         $batch = [];
         while ($options->max === 0 || count($batch) < $options->max) {
             $reserved = $io->pop($dlq);
@@ -71,6 +76,7 @@ final class Redrive
             $batch[] = [
                 'body' => $reserved['body'],
                 'handle' => $reserved['handle'],
+                'key' => $reserved['key'] ?? null,
                 'env' => $env,
                 'decoded' => $env !== [],
             ];
@@ -83,7 +89,7 @@ final class Redrive
 
         foreach ($batch as $p) {
             if (! $p['decoded']) {
-                $io->publish($dlq, $p['body']); // restore the poison body; never drop it
+                self::republishFrom($io, $dlq, $p['body'], $p['key']); // restore the poison body; never drop it
                 $io->ack($p['handle']);
                 $skipped++;
                 $items[] = new RedriveItem('', '', '', '', $dlq, '', false);
@@ -99,7 +105,7 @@ final class Redrive
 
             $select = $options->select;
             if ($select !== null && ! $select($env)) {
-                $io->publish($dlq, $p['body']); // not selected: restore unchanged
+                self::republishFrom($io, $dlq, $p['body'], $p['key']); // not selected: restore unchanged
                 $io->ack($p['handle']);
                 $skipped++;
                 $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, '', false);
@@ -110,7 +116,7 @@ final class Redrive
             $target = $options->toQueue ?? self::sourceQueueOf($env);
 
             if ($options->dryRun) {
-                $io->publish($dlq, $p['body']); // report the plan; restore unchanged
+                self::republishFrom($io, $dlq, $p['body'], $p['key']); // report the plan; restore unchanged
                 $io->ack($p['handle']);
                 $skipped++;
                 $items[] = new RedriveItem($messageId, $traceId, $urn, $reason, $dlq, $target, false);
@@ -120,9 +126,9 @@ final class Redrive
 
             $body = EnvelopeCodec::encode(self::reset($env));
             try {
-                $bypassed = self::publishRedriven($io, $target, $body, $options->bypass);
+                $bypassed = self::publishRedriven($io, $target, $body, $options->bypass, $p['key']);
             } catch (Throwable $e) {
-                $io->publish($dlq, $p['body']); // restore on a publish failure, then surface it
+                self::republishFrom($io, $dlq, $p['body'], $p['key']); // restore on a publish failure, then surface it
                 $io->ack($p['handle']);
 
                 throw $e;
@@ -141,7 +147,7 @@ final class Redrive
      * actually stamped. With no bypass, or a plain {@see RedriveIO}, it publishes plainly and
      * returns false. The PHP mirror of Go's `publishRedriven` (ADR-0027).
      */
-    private static function publishRedriven(RedriveIO $io, string $queue, string $body, bool $bypass): bool
+    private static function publishRedriven(RedriveIO $io, string $queue, string $body, bool $bypass, ?string $key): bool
     {
         if ($bypass && $io instanceof HeaderRedriveIO) {
             $io->publishWithHeaders($queue, $body, ReplayBypass::markerHeaders());
@@ -149,9 +155,25 @@ final class Redrive
             return true;
         }
 
-        $io->publish($queue, $body);
+        self::republishFrom($io, $queue, $body, $key);
 
         return false;
+    }
+
+    /**
+     * Re-publish $body to $queue carrying the DLQ record's $key when the IO is a {@see KeyedRedriveIO}
+     * (Kafka, contract §6.5 "Record key on republish"); a plain {@see RedriveIO} publishes keyless,
+     * as before. The PHP mirror of Go's `republishFrom`.
+     */
+    private static function republishFrom(RedriveIO $io, string $queue, string $body, ?string $key): void
+    {
+        if ($io instanceof KeyedRedriveIO) {
+            $io->publishKeyed($queue, $body, $key);
+
+            return;
+        }
+
+        $io->publish($queue, $body);
     }
 
     /**

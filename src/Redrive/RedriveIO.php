@@ -15,8 +15,10 @@ interface RedriveIO
     /**
      * Reserve the next message from $queue, or null when it is empty.
      *
-     * @return array{body: string, handle: mixed}|null  The raw body plus a transport-internal
-     *                                                   handle used to {@see ack()} it.
+     * @return array{body: string, handle: mixed, key?: string|null}|null  The raw body plus a
+     *         transport-internal handle used to {@see ack()} it, and — for a keyed broker (Kafka) —
+     *         the record key the message carried (`null` / absent = no key; `''` = a real, empty
+     *         key). {@see Redrive} carries it back via {@see KeyedRedriveIO} when implemented.
      */
     public function pop(string $queue): ?array;
 
