@@ -21,6 +21,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
   (`getErrors()`); a lone error is thrown as is. A plain `RedriveIO` without `rewind` is unchanged, including
   the exception thrown when a redrive write and its restore both fail (the restore error, as before).
   No wire change.
+- `Redrive\KafkaRedriveIO` (+ the `Redrive\KafkaRedriveClient` seam) — the concrete Kafka `RedriveIO`
+  (`KeyedRedriveIO` + `RewindingRedriveIO`), behavior-identical to the Go/Java/.NET redrive: the record key
+  is preserved (null stays null, `''` stays `''`; the constructor takes a `KeyedKafkaProducer`, so a keyless producer
+  cannot silently drop it); a restore writes the original record back verbatim
+  (payload, headers, key) with a fresh timestamp; an acknowledgement commits only the contiguous acked
+  prefix of its partition; a failed restore rewinds every partition that still has unacknowledged records
+  to its lowest unacknowledged offset. The client seam (poll / commit offset / seek) keeps the core free of
+  `ext-rdkafka` (ADR-0019); the production binding to `RdKafka\KafkaConsumer` is the caller's, a reference
+  one lives under `tests/Support/`. No wire change.
+- CI: an opt-in `integration-live` job (Kafka `apache/kafka:3.9.0` service container + `setup-php`
+  `extensions: rdkafka`) runs the `@group integration` live tests (`BQ_INTEGRATION=1`,
+  `BQ_KAFKA_BROKERS`): a null / empty / non-empty key read back from the broker byte for byte across
+  retry, DLQ and redrive, and the failed-restore rewind. The unit jobs run `--exclude-group integration`;
+  the live tests also skip on their own when the env is not set.
 
 ## [1.21.0] - 2026-10-11
 
