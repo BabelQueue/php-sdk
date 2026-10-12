@@ -9,6 +9,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the PHP core already behaved this way.
+
 ### Added
 - `Redrive\RewindingRedriveIO` — optional `RedriveIO` extension with `rewind(mixed $handle)` (the PHP mirror
   of Go's `Rewinder`). Whatever stops a `Redrive::run()` (the restore write back to the DLQ failed, the redrive
