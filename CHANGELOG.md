@@ -11,10 +11,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [1.22.0] - 2026-10-12
 
-### Changed
-
-- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the PHP core already behaved this way.
-
 ### Added
 - `Redrive\RewindingRedriveIO` — optional `RedriveIO` extension with `rewind(mixed $handle)` (the PHP mirror
   of Go's `Rewinder`). Whatever stops a `Redrive::run()` (the restore write back to the DLQ failed, the redrive
@@ -41,6 +37,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `BQ_KAFKA_BROKERS`): a null / empty / non-empty key read back from the broker byte for byte across
   retry, DLQ and redrive, and the failed-restore rewind. The unit jobs run `--exclude-group integration`;
   the live tests also skip on their own when the env is not set.
+
+### Changed
+
+- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the PHP core already behaved this way.
 
 ## [1.21.0] - 2026-10-11
 
