@@ -80,6 +80,22 @@ if ($reason = EnvelopeValidator::check($envelope)) {
 phpredis (`ext-redis`) users can implement the one-method `Transport` directly —
 it is just an `rpush`.
 
+### Extension keys, `meta` and strict `encode()` (ADR-0031)
+
+```php
+// Producer: extra meta keys travel next to the core ones; a collision throws.
+$envelope = EnvelopeCodec::make('urn:acme:orders:created', ['order_id' => 7], 'orders',
+    meta: ['ext' => ['acme' => ['region' => 'eu']]]);
+EnvelopeCodec::make('urn:acme:orders:created', [], 'orders', meta: ['ts' => 1]);   // InvalidEnvelopeException
+```
+
+- `decode()` keeps unknown top-level and `meta` keys, so a consumer that re-emits a message does not lose them;
+  forbidden keys are warned about and dropped.
+- `encode()` **rejects** forbidden keys (`timestamp`, `urn`, `meta.max_retries`, `meta.attempts`, `meta.source`,
+  `meta.ts`) with `InvalidEnvelopeException` instead of stripping them.
+- URN identity on `decode()`: a blank `job` (empty or ASCII whitespace only) falls back to `urn`; with both
+  present `job` wins and `urn` is dropped with a warning naming `/urn`.
+
 ## Idempotency — dedupe on `meta.id` (ADR-0022)
 
 BabelQueue is **at-least-once**, so handlers should be idempotent — dedupe on the envelope's

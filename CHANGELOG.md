@@ -9,6 +9,34 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-17
+
+Implements ADR-0031 (extension keys + producer `meta`) against conformance v1.4.0. The envelope stays frozen
+at `schema_version: 1`; nothing about the accepted wire shape widens except the `job` / `urn` resolution below.
+
+### Added
+- `EnvelopeCodec::make(..., array $meta = [])` — a producer write API for `meta` extension keys
+  (`make($urn, $data, $queue, meta: ['ext' => ['acme' => 1]])`). The entries are merged after the core keys and
+  travel through `encode` / `decode` / a re-emit unchanged (an empty object stays `{}`). A key that collides with a
+  core key or a forbidden key throws `InvalidEnvelopeException` naming the JSON pointer.
+- `EnvelopeCodec::CORE_META_KEYS` (`id`, `queue`, `lang`, `schema_version`, `created_at`).
+- The behaviour-conformance runner understands the v1.4.0 sections and optional fields: `extension_write`,
+  `encode_reject`, `forbidden_keys.expect_preserved`, `roundtrip.expect_absent_after_reencode`,
+  `roundtrip.apply_dead_letter` + `expect_dead_letter` (via `DeadLetter::annotate`), and enforces "no decode warning"
+  and `accepts()` on every roundtrip case. A unit test proves the runner reports a violation for a synthetic case.
+
+### Changed
+- **`EnvelopeCodec::encode()` rejects forbidden keys** (`timestamp`, the `urn` alias, `meta.max_retries`,
+  `meta.attempts`, `meta.source`, `meta.ts`) with `InvalidEnvelopeException` instead of warning and stripping them.
+  `decode()` is unchanged: it still warns and drops them. Code that relied on `encode()` silently stripping a
+  forbidden key must stop setting it.
+- `decode()` resolves the URN identity: a `job` that is empty or only ASCII whitespace (`" \t\n\v\f\r"`; not
+  PHP's default `trim()` set) falls back to `urn`, the resolved value becomes `job` and `urn` is not kept. When
+  `job` and `urn` are both present `job` wins, `urn` is dropped and a warning naming `/urn` is raised.
+  `accepts()` accepts a blank `job` with a valid `urn`.
+- Unknown top-level keys and `meta` entries holding an empty object keep `{}` through `decode` -> `encode`
+  (previously `json_decode(..., true)` turned them into `[]`). An empty object nested inside `data` is unchanged.
+
 ## [1.22.0] - 2026-10-12
 
 ### Added

@@ -8,6 +8,7 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\HasTraceId;
 use BabelQueue\Contracts\PolyglotJob;
 use BabelQueue\Exceptions\BabelQueueException;
+use BabelQueue\Exceptions\InvalidEnvelopeException;
 use BabelQueue\Validation\EnvelopeValidator;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -208,7 +209,7 @@ final class EnvelopeCodecTest extends TestCase
         self::assertTrue(EnvelopeCodec::accepts($envelope));
     }
 
-    public function test_encode_and_decode_warnings_say_what_actually_happened(): void
+    public function test_encode_rejects_and_decode_warns_about_forbidden_keys(): void
     {
         $warnings = [];
         EnvelopeCodec::setWarningHandler(static function (string $m) use (&$warnings): void {
@@ -218,15 +219,146 @@ final class EnvelopeCodecTest extends TestCase
         try {
             $envelope = EnvelopeCodec::make('urn:babel:x', [], 'q');
             $envelope['timestamp'] = 1;
-            EnvelopeCodec::encode($envelope);
+
+            try {
+                EnvelopeCodec::encode($envelope);
+                self::fail('encode must reject a forbidden key');
+            } catch (InvalidEnvelopeException $e) {
+                self::assertStringContainsString('/timestamp', $e->getMessage());
+            }
+
             EnvelopeCodec::decode('{"job":"urn:babel:x","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0,"timestamp":1}');
         } finally {
             EnvelopeCodec::setWarningHandler(null);
         }
 
-        self::assertCount(2, $warnings);
-        self::assertStringContainsString('it was not emitted', $warnings[0]);
-        self::assertStringContainsString('it was dropped from the decoded envelope', $warnings[1]);
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('it was dropped from the decoded envelope', $warnings[0]);
+    }
+
+    /** @return iterable<string, array{array<string, mixed>, string}> */
+    public static function forbiddenEncodeProvider(): iterable
+    {
+        yield 'timestamp' => [['timestamp' => 1], '/timestamp'];
+        yield 'urn alias' => [['urn' => 'urn:babel:x'], '/urn'];
+        yield 'meta.ts' => [['meta' => ['ts' => 1]], '/meta/ts'];
+        yield 'meta.max_retries' => [['meta' => ['max_retries' => 1]], '/meta/max_retries'];
+        yield 'meta.attempts' => [['meta' => ['attempts' => 1]], '/meta/attempts'];
+        yield 'meta.source' => [['meta' => ['source' => 'x']], '/meta/source'];
+    }
+
+    /**
+     * @param  array<string, mixed>  $extra
+     */
+    #[DataProvider('forbiddenEncodeProvider')]
+    public function test_encode_rejects_every_forbidden_key(array $extra, string $pointer): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:x', ['a' => 1], 'q');
+        $envelope = array_replace_recursive($envelope, $extra);
+
+        $this->expectException(InvalidEnvelopeException::class);
+        $this->expectExceptionMessageMatches('#' . preg_quote($pointer, '#') . '#');
+
+        EnvelopeCodec::encode($envelope);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function rejectedMetaKeyProvider(): iterable
+    {
+        foreach ([...EnvelopeCodec::CORE_META_KEYS, ...EnvelopeCodec::FORBIDDEN_META_KEYS] as $key) {
+            yield $key => [$key];
+        }
+    }
+
+    #[DataProvider('rejectedMetaKeyProvider')]
+    public function test_make_rejects_core_and_forbidden_meta_keys(string $key): void
+    {
+        $this->expectException(InvalidEnvelopeException::class);
+        $this->expectExceptionMessageMatches('#/meta/' . preg_quote($key, '#') . '#');
+
+        EnvelopeCodec::make('urn:babel:x', [], 'q', meta: [$key => 1]);
+    }
+
+    public function test_make_meta_ts_throws(): void
+    {
+        $this->expectException(InvalidEnvelopeException::class);
+
+        EnvelopeCodec::make('urn:babel:x', [], 'q', meta: ['ts' => 1]);
+    }
+
+    public function test_make_meta_extension_survives_a_round_trip(): void
+    {
+        $envelope = EnvelopeCodec::make('urn:babel:x', ['a' => 1], 'q', meta: ['ext' => ['acme' => 1], 'vendor_flag' => true]);
+
+        self::assertSame(['ext' => ['acme' => 1], 'vendor_flag' => true], array_diff_key($envelope['meta'], array_flip(EnvelopeCodec::CORE_META_KEYS)));
+        self::assertSame('q', $envelope['meta']['queue']);
+
+        $decoded = EnvelopeCodec::decode(EnvelopeCodec::encode($envelope));
+        $decoded['attempts']++;
+        $out = json_decode(EnvelopeCodec::encode($decoded), true);
+
+        self::assertSame(['acme' => 1], $out['meta']['ext']);
+        self::assertTrue($out['meta']['vendor_flag']);
+        self::assertSame(1, $out['attempts']);
+    }
+
+    public function test_empty_objects_in_meta_and_unknown_keys_survive_a_decode_encode_hop(): void
+    {
+        $raw = '{"job":"urn:babel:x","trace_id":"t","data":{},"meta":{"schema_version":1,"ctx":{},"ext":{"acme":{}}},"attempts":0,"extra":{}}';
+
+        $out = EnvelopeCodec::encode(EnvelopeCodec::decode($raw));
+
+        self::assertStringContainsString('"ctx":{}', $out);
+        self::assertStringContainsString('"ext":{"acme":{}}', $out);
+        self::assertStringContainsString('"extra":{}', $out);
+        self::assertStringContainsString('"data":{}', $out);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function blankJobProvider(): iterable
+    {
+        yield 'missing' => ['{"urn":"urn:acme:b","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'];
+        yield 'empty' => ['{"job":"","urn":"urn:acme:b","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'];
+        yield 'spaces' => ['{"job":"  ","urn":"urn:acme:b","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'];
+        yield 'all ascii whitespace' => ['{"job":" \t\n\u000b\f\r","urn":"urn:acme:b","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'];
+    }
+
+    #[DataProvider('blankJobProvider')]
+    public function test_blank_job_falls_back_to_urn_without_a_warning(string $raw): void
+    {
+        $warnings = [];
+        $envelope = EnvelopeCodec::decode($raw, static function (string $m) use (&$warnings): void {
+            $warnings[] = $m;
+        });
+
+        self::assertSame([], $warnings);
+        self::assertSame('urn:acme:b', $envelope['job']);
+        self::assertArrayNotHasKey('urn', $envelope);
+        self::assertTrue(EnvelopeCodec::accepts($envelope));
+    }
+
+    public function test_a_non_ascii_space_job_is_not_blank_and_job_wins_over_urn_with_a_warning(): void
+    {
+        $warnings = [];
+        $envelope = EnvelopeCodec::decode(
+            '{"job":"\u2003","urn":"urn:acme:b","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}',
+            static function (string $m, string $p) use (&$warnings): void {
+                $warnings[] = [$m, $p];
+            },
+        );
+
+        self::assertSame("\u{2003}", $envelope['job']);
+        self::assertArrayNotHasKey('urn', $envelope);
+        self::assertCount(1, $warnings);
+        self::assertSame('/urn', $warnings[0][1]);
+        self::assertStringContainsString('/urn', $warnings[0][0]);
+    }
+
+    public function test_a_blank_job_without_a_urn_is_not_accepted(): void
+    {
+        $envelope = EnvelopeCodec::decode('{"job":"  ","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}');
+
+        self::assertFalse(EnvelopeCodec::accepts($envelope));
     }
 
     public function test_warnings_fall_back_to_error_log_without_any_handler(): void
