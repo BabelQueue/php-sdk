@@ -355,12 +355,14 @@ final class EnvelopeCodec
     }
 
     /**
-     * Put back the empty JSON objects that json_decode(..., true) turned into [].
+     * Put back the JSON objects that json_decode(..., true) turned into lists: empty
+     * objects ({} -> []) and objects keyed "0", "1", ... ({"0":"a"} -> ["a"]).
      *
      * Only the unknown top-level keys and the "meta" entries are touched (their values
-     * are re-read in object mode); only the empty objects inside them become stdClass,
+     * are re-read in object mode); only those objects inside them become stdClass,
      * everything else stays a plain array. "data" and the owned keys stay plain arrays. The
-     * second parse runs only when the body contains an empty object at all.
+     * second parse runs only when the body contains an empty object or an object whose
+     * first key is "0".
      *
      * @param  array<string, mixed>  $envelope
      * @return array<string, mixed>

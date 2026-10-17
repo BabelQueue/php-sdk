@@ -35,7 +35,9 @@ at `schema_version: 1`; nothing about the accepted wire shape widens except the 
   `job` and `urn` are both present `job` wins, `urn` is dropped and a warning naming `/urn` is raised.
   `accepts()` accepts a blank `job` with a valid `urn`.
 - Unknown top-level keys and `meta` entries holding an empty object keep `{}` through `decode` -> `encode`
-  (previously `json_decode(..., true)` turned them into `[]`). An empty object nested inside `data` is unchanged.
+  (previously `json_decode(..., true)` turned them into `[]`). The same holds for objects whose keys are
+  `"0"`, `"1"`, … (`{"0":"a"}`): they now decode to `stdClass` instead of a PHP list, so a handler that read
+  such a value with `[0]` must read it as an object. An empty object nested inside `data` is unchanged.
 
 ## [1.22.0] - 2026-10-12
 
