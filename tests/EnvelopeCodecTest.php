@@ -496,6 +496,16 @@ final class EnvelopeCodecTest extends TestCase
         $this->assertStringContainsString('"ext":{"acme":{},"other":{"k":{}}}', $out);
         $this->assertStringContainsString('"vendor":{}', $out);
     }
+
+    public function testADigitKeyedObjectInAnUnknownOrMetaKeyStaysAnObject(): void
+    {
+        $body = '{"job":"urn:a","data":{"0":"x"},"meta":{"ext":{"0":"a","1":{"0":"b"}}},"num":{"0":"a","1":"b"},"list":["a","b"],"trace_id":"t","attempts":0,"id":"i"}';
+        $out = EnvelopeCodec::encode(EnvelopeCodec::decode($body));
+
+        $this->assertStringContainsString('"num":{"0":"a","1":"b"}', $out);
+        $this->assertStringContainsString('"ext":{"0":"a","1":{"0":"b"}}', $out);
+        $this->assertStringContainsString('"list":["a","b"]', $out);
+    }
 }
 
 class OrderJobStub implements PolyglotJob

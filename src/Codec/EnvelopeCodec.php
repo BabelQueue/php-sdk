@@ -367,7 +367,8 @@ final class EnvelopeCodec
      */
     private static function restoreEmptyObjects(array $envelope, string $rawBody): array
     {
-        if (preg_match('/\{\s*\}/', $rawBody) !== 1) {
+        // Triggers: an empty object, or an object whose first key is "0" (PHP would turn it into a list).
+        if (preg_match('/\{\s*(?:\}|"(?:0|\\\\u0030)"\s*:)/', $rawBody) !== 1) {
             return $envelope;
         }
 
@@ -399,9 +400,10 @@ final class EnvelopeCodec
 
     /**
      * Turn an object-mode value back into the plain-array shape json_decode(..., true)
-     * gives, except that every empty JSON object stays a stdClass. Non-empty objects and
-     * lists become arrays (recursively), so the type of a decoded subtree never depends on
-     * whether some unrelated part of the body holds a `{}`.
+     * gives, except that every empty JSON object stays a stdClass, and so does every object
+     * whose keys are "0", "1", ... (PHP would read it as a list and encode would write a JSON
+     * array). Other non-empty objects and lists become arrays (recursively), so the type of a
+     * decoded subtree never depends on whether some unrelated part of the body holds a `{}`.
      */
     private static function keepOnlyEmptyObjects(mixed $value): mixed
     {
@@ -414,6 +416,10 @@ final class EnvelopeCodec
             $out = [];
             foreach ($vars as $key => $item) {
                 $out[$key] = self::keepOnlyEmptyObjects($item);
+            }
+
+            if (array_is_list($out)) {
+                return (object) $out;
             }
 
             return $out;
