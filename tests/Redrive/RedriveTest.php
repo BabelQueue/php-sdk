@@ -425,4 +425,28 @@ final class RedriveTest extends TestCase
         $this->assertCount(1, $io->published);
         $this->assertSame('orders', $io->published[0][0]);
     }
+
+    public function testRedriveReadsDeadLetterWhenTheBodyCarriesEmptyObjects(): void
+    {
+        $io = new FakeIO();
+        $env = EnvelopeCodec::make('urn:babel:orders:created', [], 'orders-original');
+        $env['meta']['ext'] = ['acme' => new \stdClass()];
+        $dl = DeadLetter::annotate($env, 'failed', new RuntimeException('boom'), 'orders-original', 3);
+        $body = EnvelopeCodec::encode($dl);
+        $this->assertStringContainsString('"acme":{}', $body);
+        $io->publish('orders.dlq', $body);
+
+        $seen = [];
+        $res = Redrive::run($io, 'orders.dlq', new RedriveOptions(select: static function (array $e) use (&$seen): bool {
+            $seen[] = $e['dead_letter']['reason'];
+
+            return true;
+        }));
+
+        $this->assertSame(1, $res->redriven);
+        $this->assertSame(['failed'], $seen);
+        $this->assertCount(1, $io->queues['orders-original']);
+        $this->assertArrayNotHasKey('orders', $io->queues);
+        $this->assertStringContainsString('"acme":{}', $io->queues['orders-original'][0]);
+    }
 }

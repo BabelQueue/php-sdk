@@ -5,10 +5,16 @@ declare(strict_types=1);
 namespace BabelQueue\Exceptions;
 
 /**
- * A decoded envelope failed consumer-side validation. The {@see self::reason()}
- * is one of the `EnvelopeValidator::REASON_*` constants, so a consumer can branch
- * on it — e.g. quarantine an unsupported schema version, drop a malformed body —
- * and {@see self::envelope()} carries the offending payload for logging or
+ * An envelope was rejected. Two sources raise it:
+ *
+ *  - consumer-side validation, where {@see self::reason()} is one of the
+ *    `EnvelopeValidator::REASON_*` constants, so a consumer can branch on it —
+ *    e.g. quarantine an unsupported schema version, drop a malformed body;
+ *  - producer-side guards in `EnvelopeCodec::make()` / `encode()` (a forbidden or
+ *    reserved key, ADR-0031), where {@see self::reason()} is a human-readable
+ *    sentence, NOT a `REASON_*` constant — do not `switch` on it.
+ *
+ * {@see self::envelope()} carries the offending payload for logging or
  * dead-lettering.
  */
 final class InvalidEnvelopeException extends BabelQueueException
@@ -31,7 +37,10 @@ final class InvalidEnvelopeException extends BabelQueueException
         return new self($reason, $envelope);
     }
 
-    /** The machine-readable rejection reason (an `EnvelopeValidator::REASON_*` value). */
+    /**
+     * The rejection reason: an `EnvelopeValidator::REASON_*` value for consumer-side validation,
+     * free text for producer-side rejections (see the class doc).
+     */
     public function reason(): string
     {
         return $this->reason;

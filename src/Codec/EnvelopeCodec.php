@@ -358,7 +358,8 @@ final class EnvelopeCodec
      * Put back the empty JSON objects that json_decode(..., true) turned into [].
      *
      * Only the unknown top-level keys and the "meta" entries are touched (their values
-     * are re-read in object mode); "data" and the owned keys stay plain arrays. The
+     * are re-read in object mode); only the empty objects inside them become stdClass,
+     * everything else stays a plain array. "data" and the owned keys stay plain arrays. The
      * second parse runs only when the body contains an empty object at all.
      *
      * @param  array<string, mixed>  $envelope
@@ -379,7 +380,7 @@ final class EnvelopeCodec
         foreach (get_object_vars($raw) as $key => $value) {
             $key = (string) $key;
             if (! in_array($key, $owned, true) && array_key_exists($key, $envelope)) {
-                $envelope[$key] = $value;
+                $envelope[$key] = self::keepOnlyEmptyObjects($value);
             }
         }
 
@@ -388,12 +389,41 @@ final class EnvelopeCodec
             foreach (get_object_vars($rawMeta) as $key => $value) {
                 $key = (string) $key;
                 if (array_key_exists($key, $envelope['meta'])) {
-                    $envelope['meta'][$key] = $value;
+                    $envelope['meta'][$key] = self::keepOnlyEmptyObjects($value);
                 }
             }
         }
 
         return $envelope;
+    }
+
+    /**
+     * Turn an object-mode value back into the plain-array shape json_decode(..., true)
+     * gives, except that every empty JSON object stays a stdClass. Non-empty objects and
+     * lists become arrays (recursively), so the type of a decoded subtree never depends on
+     * whether some unrelated part of the body holds a `{}`.
+     */
+    private static function keepOnlyEmptyObjects(mixed $value): mixed
+    {
+        if ($value instanceof \stdClass) {
+            $vars = get_object_vars($value);
+            if ($vars === []) {
+                return $value;
+            }
+
+            $out = [];
+            foreach ($vars as $key => $item) {
+                $out[$key] = self::keepOnlyEmptyObjects($item);
+            }
+
+            return $out;
+        }
+
+        if (is_array($value)) {
+            return array_map(self::keepOnlyEmptyObjects(...), $value);
+        }
+
+        return $value;
     }
 
     /**

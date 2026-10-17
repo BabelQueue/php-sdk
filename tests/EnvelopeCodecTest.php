@@ -475,6 +475,27 @@ final class EnvelopeCodecTest extends TestCase
         $this->assertSame($fromJob['meta']['lang'], $fromMake['meta']['lang']);
         $this->assertSame($fromJob['meta']['schema_version'], $fromMake['meta']['schema_version']);
     }
+
+    public function testDecodeTypesDoNotDependOnEmptyObjectsElsewhereInTheBody(): void
+    {
+        $bodyWith = '{"job":"urn:a","data":{},"meta":{"ext":{"acme":{"k":1}},"flag":true},"vendor":{"a":{"b":2}},"trace_id":"t","attempts":0,"id":"i"}';
+        $bodyWithout = str_replace('"data":{}', '"data":{"x":1}', $bodyWith);
+
+        foreach ([$bodyWith, $bodyWithout] as $body) {
+            $decoded = EnvelopeCodec::decode($body);
+            $this->assertSame(['acme' => ['k' => 1]], $decoded['meta']['ext']);
+            $this->assertSame(['a' => ['b' => 2]], $decoded['vendor']);
+        }
+    }
+
+    public function testAnEmptyObjectInsideAnExtensionSurvivesARoundTrip(): void
+    {
+        $body = '{"job":"urn:a","data":{},"meta":{"ext":{"acme":{},"other":{"k":{}}}},"vendor":{},"trace_id":"t","attempts":0,"id":"i"}';
+        $out = EnvelopeCodec::encode(EnvelopeCodec::decode($body));
+
+        $this->assertStringContainsString('"ext":{"acme":{},"other":{"k":{}}}', $out);
+        $this->assertStringContainsString('"vendor":{}', $out);
+    }
 }
 
 class OrderJobStub implements PolyglotJob
