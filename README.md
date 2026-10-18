@@ -1,6 +1,8 @@
 # BabelQueue PHP SDK (core)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live interop](https://img.shields.io/endpoint?url=https%3A%2F%2Fbabelqueue.com%2Fbadges%2Fnightly.json)](https://babelqueue.com/compatibility/)
+[![BabelQueue conformance](https://img.shields.io/badge/BabelQueue-conformance%20matrix-10B981.svg)](https://babelqueue.com/compatibility/)
 
 > The **framework-agnostic core** of BabelQueue for PHP — the canonical polyglot
 > queue envelope codec, contracts and dead-letter helpers. Framework adapters
