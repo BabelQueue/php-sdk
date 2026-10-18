@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Transport\PulsarTransport;
 use BabelQueue\Transport\PulsarWebSocketClient;
+use BabelQueue\Tests\Support\ConformanceResults;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
@@ -22,31 +23,26 @@ final class PulsarConformanceTest extends TestCase
 
     public function test_property_projection_matches_the_golden(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $projection = $manifest['pulsar']['property_projection'];
-        $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
+        ConformanceResults::each('pulsar', function (array $projection): void {
+            $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
 
-        $captured = null;
-        $client = Mockery::mock(PulsarWebSocketClient::class);
-        $client->shouldReceive('publish')->once()->with(
-            Mockery::any(),
-            $body,
-            Mockery::on(function (array $properties) use (&$captured): bool {
-                $captured = $properties;
+            $captured = null;
+            $client = Mockery::mock(PulsarWebSocketClient::class);
+            $client->shouldReceive('publish')->once()->with(
+                Mockery::any(),
+                $body,
+                Mockery::on(function (array $properties) use (&$captured): bool {
+                    $captured = $properties;
 
-                return true;
-            }),
-        );
+                    return true;
+                }),
+            );
 
-        (new PulsarTransport($client, 'orders'))->publish($body);
+            (new PulsarTransport($client, 'orders'))->publish($body);
 
-        foreach ($projection['properties'] as $key => $want) {
-            $this->assertSame($want, $captured[$key], $key);
-        }
+            foreach ($projection['properties'] as $key => $want) {
+                $this->assertSame($want, $captured[$key], $key);
+            }
+        }, 'property_projection');
     }
 }

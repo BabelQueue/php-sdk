@@ -35,6 +35,14 @@ use Predis\ClientInterface;
  * {@see self::unframe()}, which detects frame-vs-bare by the reserved `__bq_frame` sentinel — a
  * frozen wire envelope can never carry it — so a bare value yields `['<value>', []]` and
  * cross-version queues interoperate.
+ *
+ * **Laravel-compatible layout (broker-bindings.md §1.1, opt-in).** By default the transport keeps
+ * the plain shared list described above. Given a `$keyPrefix` (the Laravel default is
+ * {@see self::LARAVEL_KEY_PREFIX}) it instead pushes where a Laravel `RedisQueue` worker (and the
+ * `babelqueue-redis` driver) reserves from: the ready list `<prefix><queue>` plus a wake-up on
+ * `<prefix><queue>:notify`, atomically, with the same Lua script Laravel's `RedisQueue::pushRaw()`
+ * runs. {@see self::keys()} names the four structures (ready / delayed / reserved / notify). The
+ * payload is the envelope (or header frame) byte-for-byte in both layouts.
  */
 final class RedisTransport implements HeaderPublisher
 {
@@ -47,19 +55,64 @@ final class RedisTransport implements HeaderPublisher
 
     private const FRAME_VERSION = 1;
 
+    /** Laravel's default Redis queue key prefix (`RedisQueue::getQueue()`). */
+    public const LARAVEL_KEY_PREFIX = 'queues:';
+
+    /**
+     * Laravel's `LuaScripts::push()`: RPUSH the job, then wake blocked consumers on the notify list.
+     * KEYS[1] ready list, KEYS[2] notify list, ARGV[1] payload.
+     */
+    private const LARAVEL_PUSH_SCRIPT = "redis.call('rpush', KEYS[1], ARGV[1])\nredis.call('rpush', KEYS[2], 1)";
+
+    /**
+     * @param  string|null  $keyPrefix  null (default) keeps the plain `RPUSH <queue>` list; a prefix
+     *     such as {@see self::LARAVEL_KEY_PREFIX} switches to the Laravel-compatible layout.
+     */
     public function __construct(
         private readonly ClientInterface $client,
         private readonly string $defaultQueue = 'default',
+        private readonly ?string $keyPrefix = null,
     ) {
     }
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
-        $this->client->rpush($queue ?? $this->defaultQueue, [$payload]);
+        $this->push($queue ?? $this->defaultQueue, $payload);
 
         // Redis lists carry no broker-assigned id; the envelope's own meta.id is
         // the message identity. Returning null keeps the contract honest.
         return null;
+    }
+
+    /**
+     * The Redis key names of the Laravel-compatible layout for a logical queue
+     * (broker-bindings.md §1.1): `ready` list, `delayed` sorted set, `reserved` sorted set and the
+     * blocking-pop `notify` list.
+     *
+     * @return array{ready: string, delayed: string, reserved: string, notify: string}
+     */
+    public static function keys(string $queue, string $keyPrefix = self::LARAVEL_KEY_PREFIX): array
+    {
+        $ready = $keyPrefix . $queue;
+
+        return [
+            'ready' => $ready,
+            'delayed' => $ready . ':delayed',
+            'reserved' => $ready . ':reserved',
+            'notify' => $ready . ':notify',
+        ];
+    }
+
+    private function push(string $queue, string $value): void
+    {
+        if ($this->keyPrefix === null) {
+            $this->client->rpush($queue, [$value]);
+
+            return;
+        }
+
+        $keys = self::keys($queue, $this->keyPrefix);
+        $this->client->eval(self::LARAVEL_PUSH_SCRIPT, 2, $keys['ready'], $keys['notify'], $value);
     }
 
     /**
@@ -76,7 +129,7 @@ final class RedisTransport implements HeaderPublisher
      */
     public function publishWithHeaders(string $payload, array $headers, ?string $queue = null): ?string
     {
-        $this->client->rpush($queue ?? $this->defaultQueue, [self::frameValue($payload, $headers)]);
+        $this->push($queue ?? $this->defaultQueue, self::frameValue($payload, $headers));
 
         return null;
     }

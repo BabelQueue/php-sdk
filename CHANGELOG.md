@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **Conformance known-gaps gate (tests/CI only, no runtime change).** `conformance-known-gaps.json` lists the
+  cases the SDK does not implement yet (SQS `delay`, Kafka `backoff` tiers and `retry_republish`); each is
+  actually run and reported as an honest `fail`, never written blindly. Only an assertion failure counts as a
+  known gap; any other exception breaks the test. CI and release fail on a stale gap (listed but passing or
+  skipped), an unlisted `fail`, or a gap reason without an `ADR-NNNN` / `.ssot/plans/` reference.
+  The SQS / Artemis consume-side cases (`attempts_reconciliation`, `schema_version_gate`) are per-case `skip`s
+  citing ADR-0010 / ADR-0018 (the PHP core ships producers only), not gaps.
+
+### Changed
+- **Redis layout note (documentation, no behaviour change).** `RedisTransport`'s default layout is a plain
+  `RPUSH <queue>`; it is NOT the Laravel-compatible `queues:<name>` + `:notify` layout of broker-bindings section 1.1.
+  That layout is opt-in via the `$keyPrefix` constructor argument (`RedisTransport::LARAVEL_KEY_PREFIX`), and the
+  conformance `redis_layout` cases now run through the real `publish()` instead of a re-implementation of the keys.
+- The conformance runner enforces that every `skip` in `results.json` cites an ADR (ADR-0032).
+- CI and release validate the conformance suite with a SHA-256-pinned `fetch.sh`.
+
 ## [1.23.0] - 2026-10-17
 
 Implements ADR-0031 (extension keys + producer `meta`) against conformance v1.4.0. The envelope stays frozen

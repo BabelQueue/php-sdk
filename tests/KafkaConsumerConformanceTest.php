@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Transport\KafkaConsumer;
 use BabelQueue\Transport\KafkaConsumerClient;
+use BabelQueue\Tests\Support\ConformanceResults;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
@@ -22,15 +23,7 @@ final class KafkaConsumerConformanceTest extends TestCase
 
     public function test_attempts_reconciliation_matches_the_golden_cases(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $cases = $manifest['kafka']['attempts_reconciliation']['cases'];
-
-        foreach ($cases as $case) {
+        ConformanceResults::each('kafka', function (array $case): void {
             $payload = (string) json_encode([
                 'job' => 'urn:babel:orders:created',
                 'trace_id' => 'trace-1',
@@ -49,7 +42,7 @@ final class KafkaConsumerConformanceTest extends TestCase
 
             $this->assertNotNull($message, $case['name']);
             $this->assertSame($case['expected_attempts'], $message->attempts(), $case['name']);
-        }
+        }, 'attempts_reconciliation');
     }
 
     /**
@@ -59,17 +52,11 @@ final class KafkaConsumerConformanceTest extends TestCase
      */
     public function test_schema_version_gate_matches_the_golden_cases(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $gate = $manifest['kafka']['schema_version_gate'];
+        $gate = ConformanceResults::manifest()['kafka']['schema_version_gate'];
         $body = (string) file_get_contents(__DIR__ . '/conformance/' . $gate['fixture']);
         $fixtureUrn = (string) json_decode($body, true, 512, JSON_THROW_ON_ERROR)['job'];
 
-        foreach ($gate['cases'] as $case) {
+        ConformanceResults::each('kafka', function (array $case) use ($gate, $body, $fixtureUrn): void {
             $absent = ($case['absent'] ?? false) === true;
             // A JSON null value is a header present with a null value, which §6.7 treats as absent.
             $headers = $absent ? [] : [$gate['property'] => $case['value'] === null ? null : (string) $case['value']];
@@ -89,6 +76,6 @@ final class KafkaConsumerConformanceTest extends TestCase
                 $this->assertSame($body, $message->envelope()['raw'], $label);
                 $this->assertArrayNotHasKey('job', $message->envelope(), $label);
             }
-        }
+        }, 'schema_version_gate');
     }
 }

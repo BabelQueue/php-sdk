@@ -8,38 +8,88 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
 use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Exceptions\InvalidEnvelopeException;
-use BabelQueue\Schema\PayloadValidator;
+use BabelQueue\Idempotency\Idempotent;
+use BabelQueue\Idempotency\InMemoryStore;
+use BabelQueue\Otel\Tracing;
+use BabelQueue\Tests\Support\ConformanceResults;
+use BabelQueue\Tests\Support\EnvelopeMessage;
+use BabelQueue\Transport\AmqpTransport;
+use BabelQueue\Transport\KafkaMessage;
+use BabelQueue\Transport\KafkaProducer;
+use BabelQueue\Transport\KafkaRetryRouter;
+use BabelQueue\Transport\RedisTransport;
+use BabelQueue\Transport\SqsClient;
+use BabelQueue\Transport\SqsTransport;
+use Mockery;
+use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
+use OpenTelemetry\API\Trace\Span;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Message\AMQPMessage;
 use PHPUnit\Framework\TestCase;
+use Predis\ClientInterface;
 
 /**
- * Runs the behaviour sections of the vendored cross-SDK conformance manifest:
- * `roundtrip`, `data_shape`, `forbidden_keys`, `extension_write`, `encode_reject` and
- * `payload_schema_unicode`.
+ * Runs the broker-free sections of the vendored cross-SDK conformance manifest and records every
+ * case for `results.json` (ADR-0032): `cases`, `roundtrip`, `data_shape`, `forbidden_keys`,
+ * `extension_write`, `encode_reject`, `payload_schema_unicode`, `trim`, `job_type`, `idempotency`,
+ * `traceparent`, `redis`, `redis_layout`, `rabbitmq`, `delay` and `backoff`.
  *
  * Re-encoded output is parsed with objects kept as stdClass so the comparison is
  * type-strict ({} is not [], 1 is not 1.0 or true); object key order is ignored.
+ *
+ * `delay` and `backoff` are recorded as per-case skips: this package's SQS and Kafka transports are
+ * publish-only reference producers (ADR-0010) with no release / retry-republish API, which the
+ * accepted ADRs scope to the framework workers (ADR-0012) and `KafkaRetryRouter` (ADR-0015, ADR-0019).
  */
 final class BehaviourConformanceTest extends TestCase
 {
+    use MockeryPHPUnitIntegration;
+
     private const DIR = __DIR__ . '/conformance';
+
+    /** A minimal valid envelope the delay evaluator publishes. */
+    private const DELAY_BODY = '{"job":"urn:acme:orders:created","trace_id":"t","data":{"order_id":1},"meta":{"id":"i","queue":"orders","lang":"php","schema_version":1,"created_at":1},"attempts":0}';
 
     protected function tearDown(): void
     {
         EnvelopeCodec::setWarningHandler(null);
     }
 
+    public function test_decode_cases(): void
+    {
+        ConformanceResults::each('cases', function (array $case): void {
+            $name = (string) $case['name'];
+            $envelope = EnvelopeCodec::decode($this->fixture($case));
+            self::assertSame((bool) $case['valid'], EnvelopeCodec::accepts($envelope), $name . ': verdict');
+
+            if (! $case['valid']) {
+                return;
+            }
+
+            /** @var array<string, mixed> $expect */
+            $expect = $case['expect'];
+            self::assertSame($expect['urn'], EnvelopeCodec::urn($envelope), $name . ': urn');
+            self::assertSame($expect['attempts'], $envelope['attempts'], $name . ': attempts');
+            self::assertSame($expect['lang'], $envelope['meta']['lang'] ?? null, $name . ': meta.lang');
+            self::assertSame($expect['schema_version'], $envelope['meta']['schema_version'] ?? null, $name . ': meta.schema_version');
+            self::assertSame(self::canonical($expect['data']), self::canonical($envelope['data']), $name . ': data');
+
+            foreach ((array) ($expect['dead_letter'] ?? []) as $field => $value) {
+                self::assertSame($value, $envelope['dead_letter'][$field] ?? null, $name . ': dead_letter.' . $field);
+            }
+        });
+    }
+
     public function test_roundtrip_cases(): void
     {
-        $this->cases('roundtrip');
-
-        foreach ($this->objectCases('roundtrip') as $case) {
+        ConformanceResults::each('roundtrip', function (\stdClass $case): void {
             self::assertSame([], $this->roundtripViolations($case, $this->fixture($case)), (string) $case->name);
-        }
+        }, objects: true);
     }
 
     public function test_data_shape_cases(): void
     {
-        foreach ($this->cases('data_shape') as $case) {
+        ConformanceResults::each('data_shape', function (array $case): void {
             $name = (string) $case['name'];
 
             if ($case['mode'] === 'encode') {
@@ -50,31 +100,27 @@ final class BehaviourConformanceTest extends TestCase
                 $raw = json_encode(self::pointer($out, '/data', $name), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
                 self::assertSame($case['expect_encoded_data_json'], $raw, $name . ': encoded data');
 
-                continue;
+                return;
             }
 
             self::assertSame('decode', $case['mode'], $name . ': unknown mode');
             $warnings = [];
             $envelope = EnvelopeCodec::decode($this->fixture($case), self::collector($warnings));
             self::assertSame((bool) $case['valid'], EnvelopeCodec::accepts($envelope), $name . ': verdict');
-        }
+        });
     }
 
     public function test_forbidden_key_cases(): void
     {
-        $this->cases('forbidden_keys');
-
-        foreach ($this->objectCases('forbidden_keys') as $case) {
+        ConformanceResults::each('forbidden_keys', function (\stdClass $case): void {
             self::assertSame('warn', $case->expect, $case->name . ': only warn is defined for R0');
             self::assertSame([], $this->forbiddenKeyViolations($case, $this->fixture($case)), (string) $case->name);
-        }
+        }, objects: true);
     }
 
     public function test_extension_write_cases(): void
     {
-        $this->cases('extension_write');
-
-        foreach ($this->objectCases('extension_write') as $case) {
+        ConformanceResults::each('extension_write', function (\stdClass $case): void {
             $name = (string) $case->name;
             /** @var array<string, mixed> $meta */
             $meta = get_object_vars($case->meta);
@@ -94,21 +140,19 @@ final class BehaviourConformanceTest extends TestCase
             $again = self::parse(EnvelopeCodec::encode($decoded));
             self::assertSame([], self::pointerViolations($again, $case->expect_envelope, $name . ' (re-emit)'), $name);
             self::assertSame(1, self::pointer($again, '/attempts', $name), $name . ': attempts');
-        }
+        }, objects: true);
     }
 
     public function test_encode_reject_cases(): void
     {
-        $this->cases('encode_reject');
-
-        $ran = 0;
-        foreach ($this->objectCases('encode_reject') as $case) {
+        ConformanceResults::each('encode_reject', function (\stdClass $case): void {
             $name = (string) $case->name;
             self::assertSame('reject', $case->expect, $name);
 
-            // A repeated key cannot be expressed through make(meta: [...]) (one map per call).
+            // A repeated key cannot be expressed through make(meta: [...]) (one map per call): ADR-0031
+            // lets a write API that takes one map per call skip the `meta_entries` form.
             if (isset($case->meta_entries)) {
-                continue;
+                ConformanceResults::skipCase('ADR-0031: make(meta: [...]) takes one map per call, so a repeated meta key cannot be expressed');
             }
 
             $produced = null;
@@ -130,15 +174,445 @@ final class BehaviourConformanceTest extends TestCase
                 $produced = EnvelopeCodec::encode($envelope);
             } catch (BabelQueueException $e) {
                 self::assertStringContainsString((string) $case->offending_key, $e->getMessage(), $name . ': message names the key');
-                $ran++;
 
-                continue;
+                return;
             }
 
             self::fail($name . ': must be rejected, but produced ' . (string) $produced);
+        }, objects: true);
+    }
+
+    public function test_payload_schema_unicode_cases(): void
+    {
+        /** @var array<string, mixed> $schema */
+        $schema = ConformanceResults::manifest()['payload_schema_unicode']['schema'];
+
+        ConformanceResults::each('payload_schema_unicode', static function (array $case) use ($schema): void {
+            /** @var array<string, mixed> $data */
+            $data = (array) $case['data'];
+            $valid = \BabelQueue\Schema\PayloadValidator::check($schema, $data) === null;
+            self::assertSame((bool) $case['valid'], $valid, 'case ' . (string) $case['name']);
+        });
+    }
+
+    /**
+     * ADR-0032: the ASCII trim set on `make` (urn, trace id), the blank-trace-id verdict of
+     * `accepts`, and the rule that a re-emit never trims what it forwards.
+     */
+    public function test_trim_cases(): void
+    {
+        ConformanceResults::each('trim', function (\stdClass $case): void {
+            $name = (string) $case->name;
+
+            switch ($case->mode) {
+                case 'make':
+                    if ($case->expect === 'reject') {
+                        try {
+                            EnvelopeCodec::make((string) $case->urn);
+                        } catch (BabelQueueException) {
+                            return;
+                        }
+                        self::fail($name . ': make() must reject the blank urn');
+                    }
+
+                    $envelope = EnvelopeCodec::make((string) $case->urn, [], 'orders', $case->trace_id ?? null);
+                    self::assertSame($case->expect->job, $envelope['job'], $name . ': job');
+                    if (isset($case->expect->trace_id)) {
+                        self::assertSame($case->expect->trace_id, $envelope['trace_id'], $name . ': trace_id');
+                    }
+
+                    return;
+
+                case 'decode':
+                    $this->assertDecodeVerdict($case);
+
+                    return;
+
+                case 'accepts':
+                    $envelope = EnvelopeCodec::decode($this->fixture($case));
+                    self::assertSame((bool) $case->expect_decode_ok, $envelope !== [], $name . ': decode');
+                    self::assertSame((bool) $case->expect_accepts, EnvelopeCodec::accepts($envelope), $name . ': accepts');
+
+                    return;
+
+                case 'reemit':
+                    $envelope = EnvelopeCodec::decode($this->fixture($case));
+                    self::assertNotSame([], $envelope, $name . ': decode');
+                    self::assertIsInt($envelope['attempts']);
+                    $envelope['attempts']++;
+                    $out = self::parse(EnvelopeCodec::encode($envelope));
+                    self::assertSame([], self::pointerViolations($out, $case->expect_preserved, $name), $name);
+                    self::assertSame($case->expect_attempts, self::pointer($out, '/attempts', $name), $name . ': attempts');
+
+                    return;
+            }
+
+            self::fail($name . ': unknown trim mode ' . (string) $case->mode);
+        }, objects: true);
+    }
+
+    /** ADR-0032: trimming is linear; a pathological run of padding must not cost quadratic time. */
+    public function test_trim_is_linear_on_huge_whitespace_runs(): void
+    {
+        $pad = str_repeat(" \t\n\v\f\r", 33334);
+        $start = hrtime(true);
+
+        try {
+            EnvelopeCodec::make($pad);
+            self::fail('an all-whitespace urn must be rejected');
+        } catch (BabelQueueException) {
+            // expected
+        }
+        self::assertSame('urn:acme:a', EnvelopeCodec::make($pad . 'urn:acme:a' . $pad)['job']);
+
+        $body = '{"job":"urn:acme:a","data":{},"attempts":0,"meta":{"id":"x","trace_id":' . json_encode($pad) . ',"schema_version":1}}';
+        EnvelopeCodec::accepts(EnvelopeCodec::decode($body));
+
+        self::assertLessThan(1.0, (hrtime(true) - $start) / 1e9, 'whitespace handling must stay well under a second');
+    }
+
+    /** Unit test for the ASCII trim set: Unicode whitespace is data, not padding (ADR-0032). */
+    public function test_trim_keeps_unicode_whitespace_and_trims_the_ascii_set(): void
+    {
+        self::assertSame(" \t\n\v\f\r", EnvelopeCodec::BLANK_CHARS, 'exactly the ADR-0032 set: no NUL, form feed included');
+
+        $padded = "\u{00A0}urn:acme:a\u{3000}";
+        self::assertSame($padded, EnvelopeCodec::make($padded)['job'], 'U+00A0 and U+3000 are preserved');
+        self::assertSame($padded, EnvelopeCodec::make(" \f" . $padded . "\v\t")['job'], 'ASCII padding stops at the first non-ASCII-whitespace byte');
+        self::assertSame("\u{00A0}", EnvelopeCodec::make("\u{00A0}")['job'], 'a URN of only U+00A0 is not blank');
+        self::assertSame("\0urn:acme:a", EnvelopeCodec::make("\0urn:acme:a")['job'], 'NUL is not in the trim set');
+
+        $this->expectException(BabelQueueException::class);
+        EnvelopeCodec::make("\f\v \t");
+    }
+
+    /** ADR-0032 section 6: `job` must be a string; a non-string `job` falls back to `urn` with a warning. */
+    public function test_job_type_cases(): void
+    {
+        ConformanceResults::each('job_type', function (\stdClass $case): void {
+            $this->assertDecodeVerdict($case);
+        }, objects: true);
+    }
+
+    /** ADR-0022: the seen-set contract of `Idempotent::wrap`, keyed on `meta.id` verbatim. */
+    public function test_idempotency_dedup_key(): void
+    {
+        ConformanceResults::each('idempotency', function (array $case, string $id): void {
+            self::assertSame('dedup_key', $id);
+            self::assertSame('meta.id', $case['key_field']);
+
+            $envelope = EnvelopeCodec::decode($this->fixture(['file' => $case['envelope_file']]));
+            self::assertSame($case['expected_key'], $envelope['meta']['id'] ?? null, 'meta.id is the dedupe key');
+
+            $store = new InMemoryStore();
+            $runs = 0;
+            $handler = Idempotent::wrap($store, static function () use (&$runs): void {
+                $runs++;
+            });
+            $handler(new EnvelopeMessage($envelope));
+            $handler(new EnvelopeMessage($envelope));
+
+            self::assertSame(1, $runs, 'a byte-identical redelivery is the same message');
+            self::assertTrue($store->seen($case['expected_key']), 'the seen-set is keyed on meta.id verbatim');
+        }, 'dedup_key');
+    }
+
+    public function test_idempotency_sequences(): void
+    {
+        ConformanceResults::each('idempotency', function (array $case): void {
+            $name = (string) $case['name'];
+            $store = new InMemoryStore();
+            $effects = 0;
+
+            /** @var array<string, mixed> $delivery */
+            foreach ($case['deliveries'] as $index => $delivery) {
+                $metaId = (string) $delivery['meta_id'];
+                if (! empty($delivery['forget_before'])) {
+                    $store->forget($metaId);
+                }
+
+                $ran = false;
+                $handler = Idempotent::wrap($store, static function () use (&$ran, $delivery): void {
+                    $ran = true;
+                    if (($delivery['outcome'] ?? 'ok') === 'throw') {
+                        throw new \RuntimeException('handler failed');
+                    }
+                });
+
+                $envelope = EnvelopeCodec::make('urn:acme:a');
+                $envelope['meta']['id'] = $metaId;
+
+                try {
+                    $handler(new EnvelopeMessage($envelope));
+                } catch (\RuntimeException) {
+                    // A throwing handler leaves the id unmarked; the runtime would redeliver.
+                }
+
+                self::assertSame($delivery['expect_effect'] === 'run', $ran, sprintf('%s: delivery %d effect', $name, $index));
+                $effects += $ran ? 1 : 0;
+            }
+
+            self::assertSame($case['expected_effects'], $effects, $name . ': total effects');
+        }, 'sequences');
+    }
+
+    /**
+     * ADR-0028: consumer-side W3C traceparent extraction. A valid header yields its trace and parent
+     * span ids and flags; a malformed or absent one behaves like no header and the envelope
+     * `trace_id` maps 1:1 to the trace id.
+     */
+    public function test_traceparent_cases(): void
+    {
+        ConformanceResults::each('traceparent', static function (array $case): void {
+            $name = (string) ($case['name'] ?? '');
+            self::assertSame('extract', $case['mode'], $name . ': only extract is defined');
+
+            $parent = $case['traceparent'] === null
+                ? null
+                : Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => $case['traceparent']]);
+            $expect = $case['expect'];
+
+            if ($expect['source'] === 'traceparent') {
+                self::assertNotNull($parent, $name . ': the header must be accepted');
+                $spanContext = Span::fromContext($parent)->getContext();
+                self::assertSame($expect['trace_id_hex'], $spanContext->getTraceId(), $name . ': trace id');
+                self::assertSame($expect['parent_span_id'], $spanContext->getSpanId(), $name . ': parent span id');
+                self::assertSame($expect['flags'], sprintf('%02x', $spanContext->getTraceFlags()), $name . ': flags');
+
+                return;
+            }
+
+            self::assertSame('trace_id', $expect['source']);
+            self::assertNull($parent, $name . ': a malformed or absent header is ignored');
+            self::assertSame(str_replace('-', '', (string) $case['trace_id']), $expect['trace_id_hex'], $name . ': fixture consistency');
+            self::assertSame($expect['trace_id_hex'], Tracing::traceIdOf((string) $case['trace_id']), $name . ': trace id from trace_id');
+        });
+    }
+
+    /**
+     * Redis broker-bindings.md section 1.1: the Laravel-compatible key names. The transport really
+     * pushes (an `eval` capture on a fake client): the ready list and the notify wake-up are the keys
+     * it wrote, the delayed/reserved names come from {@see RedisTransport::keys()} (a producer never
+     * touches those two structures).
+     */
+    public function test_redis_layout_cases(): void
+    {
+        ConformanceResults::each('redis_layout', static function (array $case): void {
+            $queue = (string) $case['queue'];
+            $captured = null;
+
+            $client = Mockery::mock(ClientInterface::class);
+            $client->shouldNotReceive('rpush');
+            $client->shouldReceive('eval')->once()->andReturnUsing(static function (string $script, int $numKeys, string ...$args) use (&$captured): int {
+                $captured = [$numKeys, $args];
+
+                return 1;
+            });
+
+            (new RedisTransport($client, 'default', (string) $case['key_prefix']))->publish('{"job":"urn:acme:a"}', $queue);
+
+            self::assertNotNull($captured, (string) $case['name'] . ': the transport must push');
+            [$numKeys, $args] = $captured;
+            self::assertSame(2, $numKeys, (string) $case['name'] . ': ready list + notify list');
+
+            $keys = RedisTransport::keys($queue, (string) $case['key_prefix']);
+            $actual = ['ready' => $args[0], 'delayed' => $keys['delayed'], 'reserved' => $keys['reserved'], 'notify' => $args[1]];
+            $expected = $case['expect'];
+            ksort($actual);
+            ksort($expected);
+            self::assertSame($expected, $actual, (string) $case['name']);
+            self::assertSame('{"job":"urn:acme:a"}', $args[2], (string) $case['name'] . ': the payload is pushed byte for byte');
+        });
+    }
+
+    /** Redis broker-bindings.md section 1: the list element is the byte-identical envelope. */
+    public function test_redis_payload_identity(): void
+    {
+        ConformanceResults::each('redis', function (array $case): void {
+            $body = $this->fixture(['file' => $case['envelope_file']]);
+            $pushed = [];
+
+            $client = Mockery::mock(ClientInterface::class);
+            $client->shouldReceive('rpush')->once()->andReturnUsing(static function (string $key, array $values) use (&$pushed): int {
+                $pushed = [$key, $values];
+
+                return 1;
+            });
+
+            (new RedisTransport($client))->publish($body, 'orders');
+
+            self::assertSame(['orders', [$body]], $pushed, 'the queue element is the envelope, byte for byte');
+        }, 'payload_identity');
+    }
+
+    /** RabbitMQ broker-bindings.md section 2: native AMQP 0-9-1 property and header projection. */
+    public function test_rabbitmq_property_projection(): void
+    {
+        ConformanceResults::each('rabbitmq', function (array $case): void {
+            $body = $this->fixture(['file' => $case['envelope_file']]);
+            $captured = null;
+
+            $channel = Mockery::mock(AMQPChannel::class);
+            $channel->shouldReceive('queue_declare')->once();
+            $channel->shouldReceive('basic_publish')->once()->with(
+                Mockery::on(static function (AMQPMessage $message) use (&$captured): bool {
+                    $captured = $message;
+
+                    return true;
+                }),
+                '',
+                'orders',
+            );
+
+            (new AmqpTransport($channel, 'default'))->publish($body, 'orders');
+
+            self::assertInstanceOf(AMQPMessage::class, $captured);
+            self::assertSame($body, $captured->getBody(), 'the body is the byte-identical envelope');
+            foreach ($case['properties'] as $property => $value) {
+                self::assertSame($value, $captured->get($property), 'property ' . $property);
+            }
+            $headers = $captured->get('application_headers')->getNativeData();
+            foreach ($case['headers'] as $header => $value) {
+                self::assertSame($value, $headers[$header] ?? null, 'header ' . $header);
+            }
+        }, 'property_projection');
+    }
+
+    /**
+     * SQS delay (broker-bindings.md section 3.4): the case is run against the real `SqsTransport` and a
+     * recording client. The transport has no way to request a delay today (`publish()` takes no
+     * `$delaySeconds`), so every case fails an assertion and is listed in `conformance-known-gaps.json`
+     * (follow-up: DEVAM.md "Açık işler"). Once the parameter exists the evaluator checks the real
+     * `DelaySeconds` / rejection, so a listed case that starts passing is flagged as a stale gap.
+     */
+    public function test_sqs_delay(): void
+    {
+        ConformanceResults::each('delay', function (array $case): void {
+            self::assertMethodParameter(SqsTransport::class, 'publish', 'delaySeconds', 'the transport cannot be asked for a DelaySeconds');
+
+            $fifo = $case['queue_type'] === 'fifo';
+            $sent = [];
+            $client = Mockery::mock(SqsClient::class);
+            $client->shouldReceive('sendMessage')->zeroOrMoreTimes()->andReturnUsing(static function (array $args) use (&$sent): mixed {
+                $sent[] = $args;
+
+                return null;
+            });
+            $transport = new SqsTransport($client, 'https://sqs.eu-central-1.amazonaws.com/123456789012/orders', $fifo, $fifo ? 'group' : null, $fifo);
+            $body = self::DELAY_BODY;
+
+            if ($case['expect'] === 'reject') {
+                try {
+                    $transport->publish($body, null, delaySeconds: $case['delay_seconds']);
+                    self::fail('the publish must raise BabelQueueException');
+                } catch (BabelQueueException) {
+                    self::assertSame([], $sent, 'a rejected delay must not send anything');
+                }
+
+                return;
+            }
+
+            $transport->publish($body, null, delaySeconds: $case['delay_seconds']);
+            self::assertCount(1, $sent);
+            self::assertSame($case['expect']['delay_seconds_attribute'], $sent[0]['DelaySeconds'] ?? null, 'DelaySeconds');
+        });
+    }
+
+    /**
+     * SQS release (broker-bindings.md section 3.5): needs `ChangeMessageVisibility` on the client seam and a
+     * release on the transport; neither exists, so the cases are listed known gaps (see {@see test_sqs_delay()}).
+     */
+    public function test_sqs_release_visibility(): void
+    {
+        ConformanceResults::each('delay', function (array $case): void {
+            self::assertTrue((new \ReflectionClass(SqsClient::class))->hasMethod('changeMessageVisibility'), 'the SqsClient seam has no changeMessageVisibility operation');
+            self::assertTrue(method_exists(SqsTransport::class, 'release'), 'SqsTransport has no release()');
+
+            $calls = [];
+            $client = Mockery::mock(SqsClient::class);
+            $client->shouldReceive('changeMessageVisibility')->once()->andReturnUsing(static function (array $args) use (&$calls): mixed {
+                $calls[] = $args;
+
+                return null;
+            });
+            (new SqsTransport($client, 'https://sqs.eu-central-1.amazonaws.com/123456789012/orders'))->release('receipt-handle', $case['delay_seconds']);
+
+            self::assertCount(1, $calls);
+            self::assertSame($case['expect']['visibility_timeout'], $calls[0]['VisibilityTimeout'] ?? null, 'VisibilityTimeout');
+        }, 'release_visibility');
+    }
+
+    /**
+     * Kafka backoff tiers (broker-bindings.md section 6.4): the case is run against the real
+     * `KafkaRetryRouter`. `route()` picks the tier by attempts and takes no requested delay (no
+     * `$delayMs`), so every case fails an assertion and is a listed known gap; once the parameter exists the
+     * evaluator checks the real topic and headers, so a case that starts passing is flagged as stale.
+     */
+    public function test_kafka_backoff_tiers(): void
+    {
+        ConformanceResults::each('backoff', fn (array $case) => $this->evaluateKafkaTier($case, (int) $case['delay_ms'], 0));
+    }
+
+    /** Kafka release/retry republish (section 6.5); same evaluator and gap rules as {@see test_kafka_backoff_tiers()}. */
+    public function test_kafka_retry_republish(): void
+    {
+        ConformanceResults::each('backoff', fn (array $case) => $this->evaluateKafkaTier($case, (int) $case['release_delay_ms'], (int) $case['attempts']), 'retry_republish');
+    }
+
+    /**
+     * @param  array<string, mixed>  $case
+     */
+    private function evaluateKafkaTier(array $case, int $delayMs, int $attempts): void
+    {
+        self::assertMethodParameter(KafkaRetryRouter::class, 'route', 'delayMs', 'the router cannot be asked for a delay');
+
+        $sent = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->zeroOrMoreTimes()->andReturnUsing(static function (string $topic, string $payload, array $headers) use (&$sent): void {
+            $sent[] = ['topic' => $topic, 'payload' => $payload, 'headers' => $headers];
+        });
+        $router = new KafkaRetryRouter($producer, $case['retry_tiers_ms']);
+        $message = new KafkaMessage([
+            'job' => 'urn:acme:orders:created',
+            'trace_id' => 'trace-1',
+            'data' => ['order_id' => 1],
+            'meta' => ['id' => 'msg-1', 'queue' => $case['work_topic'], 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
+            'attempts' => $attempts,
+        ]);
+
+        if ($case['expect'] === 'reject') {
+            try {
+                $router->route($message, null, delayMs: $delayMs);
+                self::fail('the route must raise BabelQueueException');
+            } catch (BabelQueueException) {
+                self::assertSame([], $sent, 'a rejected delay must not produce anything');
+            }
+
+            return;
         }
 
-        self::assertGreaterThan(0, $ran);
+        $router->route($message, null, delayMs: $delayMs);
+        self::assertCount(1, $sent);
+
+        // The tier is only observable through the topic; this SDK numbers `<topic>.retry.<n>` 1-based by ascending delay.
+        $tiers = $case['retry_tiers_ms'];
+        sort($tiers);
+        $tierNumber = array_search($case['expect']['tier_ms'], $tiers, true);
+        self::assertNotFalse($tierNumber, 'fixture consistency: tier_ms is one of retry_tiers_ms');
+        self::assertSame($case['work_topic'] . '.retry.' . ($tierNumber + 1), $sent[0]['topic'], 'tier topic');
+        foreach ($case['expect']['headers'] as $header => $value) {
+            self::assertSame($value, $sent[0]['headers'][$header] ?? null, 'header ' . $header);
+        }
+        if (isset($case['expect']['body_attempts'])) {
+            self::assertSame($case['expect']['body_attempts'], EnvelopeCodec::decode($sent[0]['payload'])['attempts'] ?? null, 'body attempts');
+        }
+    }
+
+    /** Fails an assertion (an expected known gap, never an error) when `$class::$method()` lacks the named parameter. */
+    private static function assertMethodParameter(string $class, string $method, string $parameter, string $why): void
+    {
+        $names = array_map(static fn (\ReflectionParameter $p): string => $p->getName(), (new \ReflectionMethod($class, $method))->getParameters());
+        self::assertContains($parameter, $names, $class . '::' . $method . '() has no $' . $parameter . ' parameter: ' . $why);
     }
 
     /**
@@ -200,25 +674,6 @@ final class BehaviourConformanceTest extends TestCase
         self::assertNotSame([], $this->forbiddenKeyViolations($forbidden, $forbiddenBody), 'forbidden_keys: no warning names the key');
     }
 
-    public function test_payload_schema_unicode_cases(): void
-    {
-        $section = $this->manifest()['payload_schema_unicode'] ?? null;
-        if (! is_array($section)) {
-            self::markTestSkipped('manifest has no payload_schema_unicode section');
-        }
-
-        /** @var array<string, mixed> $schema */
-        $schema = $section['schema'];
-        self::assertNotEmpty($section['cases']);
-
-        foreach ($section['cases'] as $case) {
-            /** @var array<string, mixed> $data */
-            $data = (array) $case['data'];
-            $valid = PayloadValidator::check($schema, $data) === null;
-            self::assertSame((bool) $case['valid'], $valid, 'case ' . (string) $case['name']);
-        }
-    }
-
     public function test_encoder_never_emits_forbidden_keys(): void
     {
         $envelope = EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 1], 'orders');
@@ -234,31 +689,39 @@ final class BehaviourConformanceTest extends TestCase
         EnvelopeCodec::encode($envelope);
     }
 
-    // ------------------------------------------------------------------ helpers
-
-    /** @return array<string, mixed> */
-    private function manifest(): array
+    /** Shared by `trim` (decode mode) and `job_type`: a decode verdict plus the urn and warning expectation. */
+    private function assertDecodeVerdict(\stdClass $case): void
     {
-        $path = self::DIR . '/manifest.json';
-        if (! is_file($path)) {
-            self::markTestSkipped('vendored conformance suite not present');
+        $name = (string) $case->name;
+        $warnings = [];
+        $envelope = EnvelopeCodec::decode($this->fixture($case), self::collector($warnings));
+
+        if (! $case->valid) {
+            self::assertSame([], $envelope, $name . ': decode must reject');
+
+            return;
         }
 
-        /** @var array<string, mixed> */
-        return (array) json_decode((string) file_get_contents($path), true, 512, JSON_THROW_ON_ERROR);
+        self::assertNotSame([], $envelope, $name . ': decode must accept');
+        self::assertSame($case->expect->urn, EnvelopeCodec::urn($envelope), $name . ': urn');
+        self::assertSame((bool) ($case->expect_warning ?? false), $warnings !== [], $name . ': warning');
     }
 
-    /** @return list<array<string, mixed>> */
-    private function cases(string $section): array
+    /** Key-sorted JSON, so object key order is ignored while types stay strict. */
+    private static function canonical(mixed $value): string
     {
-        $block = $this->manifest()[$section] ?? null;
-        if (! is_array($block) || ! is_array($block['cases'] ?? null)) {
-            self::markTestSkipped('manifest has no ' . $section . ' section');
-        }
-        self::assertNotEmpty($block['cases']);
+        $sort = static function (mixed $v) use (&$sort): mixed {
+            if (! is_array($v)) {
+                return $v;
+            }
+            if (! array_is_list($v)) {
+                ksort($v);
+            }
 
-        /** @var list<array<string, mixed>> */
-        return $block['cases'];
+            return array_map($sort, $v);
+        };
+
+        return json_encode($sort($value), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 
     /**
@@ -394,18 +857,6 @@ final class BehaviourConformanceTest extends TestCase
         return $violations;
     }
 
-    /**
-     * A manifest section re-read with objects kept as stdClass, so {} stays {}.
-     *
-     * @return list<\stdClass>
-     */
-    private function objectCases(string $section): array
-    {
-        $raw = json_decode((string) file_get_contents(self::DIR . '/manifest.json'), false, 512, JSON_THROW_ON_ERROR);
-
-        /** @var list<\stdClass> */
-        return $raw->{$section}->cases;
-    }
 
     /** @param  array<string, mixed>|\stdClass  $case */
     private function fixture(array|\stdClass $case): string

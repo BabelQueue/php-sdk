@@ -54,8 +54,12 @@ final class EnvelopeCodec
      */
     public const CORE_META_KEYS = ['id', 'queue', 'lang', 'schema_version', 'created_at'];
 
-    /** ASCII whitespace that makes a "job" blank (ADR-0031 (c)); trim()'s default set is not used. */
-    private const BLANK_CHARS = " \t\n\v\f\r";
+    /**
+     * The one ASCII whitespace set (ADR-0032): space, \t, \n, \v, \f, \r. It makes a "job" blank
+     * (ADR-0031 (c)) and is what make() trims a URN and a trace_id with. PHP's trim() default set
+     * (it adds NUL and omits \f) is never used, and Unicode spaces such as U+00A0 are not whitespace.
+     */
+    public const BLANK_CHARS = " \t\n\v\f\r";
 
     /**
      * Process-wide warning sink: fn(string $message, string $pointer): void.
@@ -91,7 +95,7 @@ final class EnvelopeCodec
      */
     public static function make(string $urn, array $data = [], string $queue = 'default', ?string $traceId = null, array $meta = []): array
     {
-        $resolvedUrn = trim($urn);
+        $resolvedUrn = trim($urn, self::BLANK_CHARS);
 
         if ($resolvedUrn === '') {
             throw new BabelQueueException(
@@ -118,7 +122,7 @@ final class EnvelopeCodec
             }
         }
 
-        $inheritedTrace = $traceId === null ? '' : trim($traceId);
+        $inheritedTrace = $traceId === null ? '' : trim($traceId, self::BLANK_CHARS);
 
         return [
             'job' => $resolvedUrn,
@@ -196,6 +200,9 @@ final class EnvelopeCodec
      * only ASCII whitespace (space, \t, \n, \v, \f, \r) counts as absent and the
      * "urn" alias supplies it silently; the "urn" key never survives. When both carry
      * a value, "job" wins and "urn" is dropped with a warning naming /urn.
+     * A "job" that is present but not a string (null included) is ignored with a warning naming
+     * /job and "urn" supplies the identity; a non-string "urn" is ignored. When neither is a
+     * non-blank string the result is [] (poison), like malformed JSON (ADR-0032).
      *
      * Unknown top-level and "meta" keys are kept untouched (ADR-0031 (a)). An empty
      * JSON object inside them stays an object (a stdClass) so a re-emit writes {} back,
@@ -231,6 +238,17 @@ final class EnvelopeCodec
 
         $decoded = self::stripForbiddenKeys($decoded, $onWarning, 'it was dropped from the decoded envelope');
         $decoded = self::resolveUrnAlias($decoded, $onWarning);
+
+        if (self::urn($decoded) === '') {
+            self::warn(
+                'BabelQueue envelope rejected: neither "job" (/job) nor the "urn" alias (/urn) is a '
+                . 'non-blank string (ADR-0032).',
+                '/job',
+                $onWarning,
+            );
+
+            return [];
+        }
 
         return self::restoreEmptyObjects($decoded, $rawBody);
     }
@@ -297,7 +315,7 @@ final class EnvelopeCodec
 
         $traceId = $envelope['trace_id'] ?? null;
 
-        return is_string($traceId) && $traceId !== '';
+        return is_string($traceId) && trim($traceId, self::BLANK_CHARS) !== '';
     }
 
     /**
@@ -336,12 +354,22 @@ final class EnvelopeCodec
      */
     private static function resolveUrnAlias(array $envelope, ?callable $onWarning): array
     {
+        $job = $envelope['job'] ?? null;
+
+        // ADR-0032: a present, non-string "job" is ignored and the decoder MUST warn.
+        if (array_key_exists('job', $envelope) && ! is_string($job)) {
+            self::warn(
+                'BabelQueue envelope "job" (/job) is not a string and was ignored; the "urn" alias is used if valid.',
+                '/job',
+                $onWarning,
+            );
+        }
+
         if (! array_key_exists('urn', $envelope)) {
             return $envelope;
         }
 
-        $job = $envelope['job'] ?? null;
-        $jobBlank = $job === null || (is_string($job) && self::isBlank($job));
+        $jobBlank = ! is_string($job) || self::isBlank($job);
 
         if (! $jobBlank) {
             self::warnForbidden('/urn', $onWarning, 'it was dropped from the decoded envelope');
@@ -535,7 +563,7 @@ final class EnvelopeCodec
      */
     private static function resolveUrn(PolyglotJob $job): string
     {
-        $urn = trim($job->getBabelUrn());
+        $urn = trim($job->getBabelUrn(), self::BLANK_CHARS);
 
         if ($urn === '') {
             throw new BabelQueueException(sprintf(

@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Transport\KafkaProducer;
 use BabelQueue\Transport\KafkaTransport;
+use BabelQueue\Tests\Support\ConformanceResults;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
@@ -22,32 +23,27 @@ final class KafkaConformanceTest extends TestCase
 
     public function test_header_projection_matches_the_golden(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $projection = $manifest['kafka']['property_projection'];
-        $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
+        ConformanceResults::each('kafka', function (array $projection): void {
+            $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
 
-        $captured = null;
-        $producer = Mockery::mock(KafkaProducer::class);
-        $producer->shouldReceive('produce')->once()->with(
-            Mockery::any(),
-            $body,
-            Mockery::on(function (array $headers) use (&$captured): bool {
-                $captured = $headers;
+            $captured = null;
+            $producer = Mockery::mock(KafkaProducer::class);
+            $producer->shouldReceive('produce')->once()->with(
+                Mockery::any(),
+                $body,
+                Mockery::on(function (array $headers) use (&$captured): bool {
+                    $captured = $headers;
 
-                return true;
-            }),
-            Mockery::any(),
-        );
+                    return true;
+                }),
+                Mockery::any(),
+            );
 
-        (new KafkaTransport($producer, 'orders'))->publish($body);
+            (new KafkaTransport($producer, 'orders'))->publish($body);
 
-        foreach ($projection['headers'] as $key => $want) {
-            $this->assertSame($want, $captured[$key], $key);
-        }
+            foreach ($projection['headers'] as $key => $want) {
+                $this->assertSame($want, $captured[$key], $key);
+            }
+        }, 'property_projection');
     }
 }

@@ -123,7 +123,7 @@ final class PulsarConsumer
         // blank. A body without a job is never routed (the property cannot stand in for it).
         $bodyUrn = EnvelopeCodec::urn($envelope);
         $rawJob = $properties['bq-job'] ?? null;
-        $propertyUrn = is_string($rawJob) ? trim($rawJob) : '';
+        $propertyUrn = is_string($rawJob) ? trim($rawJob, EnvelopeCodec::BLANK_CHARS) : '';
         $routedUrn = null;
 
         if ($bodyUrn !== '' && $propertyUrn !== '') {

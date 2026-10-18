@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # The canonical conformance release this SDK is vendored from (ADR-0032).
+  BQ_CONFORMANCE_VERSION: "1.5.0"
+  # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather than
+  # trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
+  BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
+
 jobs:
   test:
     name: PHP ${{ matrix.php }}
@@ -31,8 +38,37 @@ jobs:
       - name: Install dependencies
         run: composer update --prefer-dist --no-interaction --no-progress
 
-      - name: Run tests
+      - name: Run tests (writes results.json)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
         run: vendor/bin/phpunit --exclude-group integration
+
+      # The runner already fails the run when a bound transport is missing from `bindings` or
+      # its sections are missing from the results (ADR-0032 Compliance); this checks the shape.
+      - name: Validate results.json against the schema
+        run: |
+          python3 -m pip install --quiet jsonschema
+          python3 -I - "$RUNNER_TEMP/results.json" tests/conformance/schema/results.schema.json conformance-known-gaps.json <<'PY'
+          import json, re, sys
+          import jsonschema
+          results = json.load(open(sys.argv[1]))
+          jsonschema.validate(results, json.load(open(sys.argv[2])))
+          gaps = json.load(open(sys.argv[3]))["gaps"]
+          listed = {(g["section"], g["case"]) for g in gaps}
+          unreferenced = sorted((g["section"], g["case"]) for g in gaps if not re.search(r"ADR-[0-9]{4}|\.ssot/plans/", g.get("reason", "")))
+          status = {(s, c): v["status"] for s, cases in results["sections"].items() for c, v in cases.items()}
+          failed = {k for k, v in status.items() if v == "fail"}
+          unlisted = sorted(failed - listed)
+          stale = sorted(k for k in listed if status.get(k) != "fail")
+          for s, c in unreferenced:
+              print(f"::error::gap {s}/{c} must reference an ADR-NNNN or a .ssot/plans/ entry in its reason")
+          for s, c in unlisted:
+              print(f"::error::fail of {s}/{c} is not listed in conformance-known-gaps.json")
+          for s, c in stale:
+              print(f"::error::stale gap: {s}/{c} is listed in conformance-known-gaps.json but is {status.get((s, c), 'not reported')}; remove the entry")
+          print(f"results.json valid; fail = {len(failed)} (known gaps = {len(failed & listed)}, unlisted = {len(unlisted)}, stale = {len(stale)}, unreferenced = {len(unreferenced)})")
+          sys.exit(1 if unlisted or stale or unreferenced else 0)
+          PY
 
   static-analysis:
     name: Static analysis (PHPStan)
@@ -122,14 +158,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Verify vendored conformance matches the canonical suite
+      - name: Fetch the pinned conformance release script
         run: |
-          git clone --depth 1 --branch v1.4.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "tests/conformance/CONFORMANCE_VERSION"
-          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "tests/conformance/manifest.json"
-          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "tests/conformance/fixtures"
-          diff -ru "$RUNNER_TEMP/conformance/schema"        "tests/conformance/schema"
-          echo "Vendored conformance is in sync with the canonical suite."
+          curl -fsSL -o "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/fetch.sh"
+      - name: Verify vendored conformance matches the pinned release (checksum-verified)
+        run: '"$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" tests/conformance'
 
   ci-green:
     name: CI green

@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Transport\PulsarConsumer;
 use BabelQueue\Transport\PulsarWebSocketConsumerClient;
+use BabelQueue\Tests\Support\ConformanceResults;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
@@ -21,15 +22,7 @@ final class PulsarConsumerConformanceTest extends TestCase
 
     public function test_attempts_reconciliation_matches_the_golden_cases(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $cases = $manifest['pulsar']['attempts_reconciliation']['cases'];
-
-        foreach ($cases as $case) {
+        ConformanceResults::each('pulsar', function (array $case): void {
             $payload = (string) json_encode([
                 'job' => 'urn:babel:orders:created',
                 'trace_id' => 'trace-1',
@@ -50,7 +43,7 @@ final class PulsarConsumerConformanceTest extends TestCase
 
             $this->assertNotNull($message, $case['name']);
             $this->assertSame($case['expected_attempts'], $message->attempts(), $case['name']);
-        }
+        }, 'attempts_reconciliation');
     }
 
     /**
@@ -60,17 +53,11 @@ final class PulsarConsumerConformanceTest extends TestCase
      */
     public function test_schema_version_gate_matches_the_golden_cases(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $gate = $manifest['pulsar']['schema_version_gate'];
+        $gate = ConformanceResults::manifest()['pulsar']['schema_version_gate'];
         $body = (string) file_get_contents(__DIR__ . '/conformance/' . $gate['fixture']);
         $fixtureUrn = (string) json_decode($body, true, 512, JSON_THROW_ON_ERROR)['job'];
 
-        foreach ($gate['cases'] as $case) {
+        ConformanceResults::each('pulsar', function (array $case) use ($gate, $body, $fixtureUrn): void {
             $absent = ($case['absent'] ?? false) === true;
             $properties = $absent ? [] : [$gate['property'] => (string) $case['value']];
             $label = $absent ? 'absent' : bin2hex((string) $case['value']);
@@ -94,6 +81,6 @@ final class PulsarConsumerConformanceTest extends TestCase
                 $this->assertSame($body, $message->envelope()['raw'], $label);
                 $this->assertArrayNotHasKey('job', $message->envelope(), $label);
             }
-        }
+        }, 'schema_version_gate');
     }
 }

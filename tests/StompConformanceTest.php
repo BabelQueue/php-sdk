@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Transport\StompClient;
 use BabelQueue\Transport\StompTransport;
+use BabelQueue\Tests\Support\ConformanceResults;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
@@ -26,34 +27,57 @@ final class StompConformanceTest extends TestCase
 
     public function test_property_projection_matches_the_golden(): void
     {
-        $manifest = json_decode(
-            (string) file_get_contents(__DIR__ . '/conformance/manifest.json'),
-            true,
-            512,
-            JSON_THROW_ON_ERROR,
-        );
-        $projection = $manifest['artemis']['property_projection'];
-        $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
+        ConformanceResults::each('artemis', function (array $projection): void {
+            $body = (string) file_get_contents(__DIR__ . '/conformance/' . $projection['envelope_file']);
 
-        $captured = null;
-        $client = Mockery::mock(StompClient::class);
-        $client->shouldReceive('send')->once()->with(
-            Mockery::any(),
-            $body,
-            Mockery::on(function (array $headers) use (&$captured): bool {
-                $captured = $headers;
+            $captured = null;
+            $client = Mockery::mock(StompClient::class);
+            $client->shouldReceive('send')->once()->with(
+                Mockery::any(),
+                $body,
+                Mockery::on(function (array $headers) use (&$captured): bool {
+                    $captured = $headers;
 
-                return true;
-            }),
-        );
+                    return true;
+                }),
+            );
 
-        (new StompTransport($client, 'orders'))->publish($body);
+            (new StompTransport($client, 'orders'))->publish($body);
 
-        // The string-valued bq_ properties — the part the STOMP framing can carry.
-        foreach ($projection['properties'] as $key => $want) {
-            $this->assertSame($want, $captured[$key], $key);
+            // The string-valued bq_ properties — the part the STOMP framing can carry.
+            foreach ($projection['properties'] as $key => $want) {
+                $this->assertSame($want, $captured[$key], $key);
+            }
+            // trace_id rides STOMP correlation-id (→ AMQP correlation-id).
+            $this->assertSame($projection['correlation_id'], $captured['correlation-id']);
+        }, 'property_projection');
+    }
+
+    /**
+     * Consume-side cases (`attempts_reconciliation`, `schema_version_gate`, broker-bindings.md §7.5/§7.7) belong to
+     * a consumer. The php-sdk core is framework-agnostic and publish-only (ADR-0010, ADR-0018); `StompTransport` only
+     * publishes and consumption runs in the framework workers (Laravel/Symfony), where the cases are
+     * evaluated. They are therefore recorded as per-case `skip`s citing the ADRs (user decision 2026-10-18),
+     * not as gaps. The test pins the recorded status and the citation, and that no core consumer exists:
+     * adding one means the skips must be replaced by real evaluation.
+     */
+    public function test_consume_side_cases_are_skipped_with_an_adr(): void
+    {
+        self::assertFalse(class_exists('BabelQueue\\Transport\\StompConsumer'), 'a core consumer would implement §7.5/§7.7: evaluate the cases instead of skipping them');
+        self::assertFalse(method_exists(StompTransport::class, 'receive'), 'StompTransport::receive would implement §7.5/§7.7: evaluate the cases instead of skipping them');
+
+        ConformanceResults::skipAll('artemis', 'Artemis (STOMP) consumption is out of scope for the framework-agnostic core (ADR-0010, ADR-0018); it runs in the framework workers', 'attempts_reconciliation');
+        ConformanceResults::skipAll('artemis', 'Artemis (STOMP) consumption is out of scope for the framework-agnostic core (ADR-0010, ADR-0018); it runs in the framework workers', 'schema_version_gate');
+
+        foreach (['attempts_reconciliation', 'schema_version_gate'] as $sub) {
+            $ids = array_keys(ConformanceResults::cases('artemis', $sub));
+            self::assertNotEmpty($ids);
+            foreach ($ids as $id) {
+                $recorded = ConformanceResults::recorded()['artemis'][(string) $id] ?? null;
+                self::assertSame('skip', $recorded['status'] ?? null, 'artemis/' . $id);
+                self::assertMatchesRegularExpression('/ADR-\d{4}/', $recorded['reason'] ?? '', 'artemis/' . $id . ' cites an ADR');
+                self::assertArrayNotHasKey('artemis/' . $id, ConformanceResults::knownGaps(), 'a skipped case is not a known gap');
+            }
         }
-        // trace_id rides STOMP correlation-id (→ AMQP correlation-id).
-        $this->assertSame($projection['correlation_id'], $captured['correlation-id']);
     }
 }

@@ -11,8 +11,22 @@ jobs:
   validate:
     name: Validate (tests green before publishing)
     runs-on: ubuntu-latest
+    env:
+      # The pinned conformance release (ADR-0032). Keep identical to ci.yml.
+      BQ_CONFORMANCE_VERSION: "1.5.0"
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
       - uses: actions/checkout@v7
+
+      # A tag may land on a commit CI never saw: re-verify the vendored suite against the
+      # release asset before the results.json below is allowed to claim this version.
+      - name: Verify the vendored suite against the release asset
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
+          bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" tests/conformance
+          test "$(tr -d '[:space:]' < tests/conformance/CONFORMANCE_VERSION)" = "$BQ_CONFORMANCE_VERSION"
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -25,8 +39,44 @@ jobs:
       - name: Install dependencies
         run: composer update --prefer-dist --no-interaction --no-progress
 
-      - name: Run tests
+      # The run produces the package's own conformance proof (ADR-0032). The runner fails the
+      # run when a bound transport is missing from `bindings` or its sections are missing.
+      - name: Run tests (writes results.json)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
         run: vendor/bin/phpunit
+
+      - name: Validate results.json against the schema
+        run: |
+          python3 -m pip install --quiet jsonschema
+          python3 -I - "$RUNNER_TEMP/results.json" tests/conformance/schema/results.schema.json conformance-known-gaps.json <<'PY'
+          import json, re, sys
+          import jsonschema
+          results = json.load(open(sys.argv[1]))
+          jsonschema.validate(results, json.load(open(sys.argv[2])))
+          gaps = json.load(open(sys.argv[3]))["gaps"]
+          listed = {(g["section"], g["case"]) for g in gaps}
+          unreferenced = sorted((g["section"], g["case"]) for g in gaps if not re.search(r"ADR-[0-9]{4}|\.ssot/plans/", g.get("reason", "")))
+          status = {(s, c): v["status"] for s, cases in results["sections"].items() for c, v in cases.items()}
+          failed = {k for k, v in status.items() if v == "fail"}
+          unlisted = sorted(failed - listed)
+          stale = sorted(k for k in listed if status.get(k) != "fail")
+          for s, c in unreferenced:
+              print(f"::error::gap {s}/{c} must reference an ADR-NNNN or a .ssot/plans/ entry in its reason")
+          for s, c in unlisted:
+              print(f"::error::fail of {s}/{c} is not listed in conformance-known-gaps.json")
+          for s, c in stale:
+              print(f"::error::stale gap: {s}/{c} is listed in conformance-known-gaps.json but is {status.get((s, c), 'not reported')}; remove the entry")
+          print(f"results.json valid; fail = {len(failed)} (known gaps = {len(failed & listed)}, unlisted = {len(unlisted)}, stale = {len(stale)}, unreferenced = {len(unreferenced)})")
+          sys.exit(1 if unlisted or stale or unreferenced else 0)
+          PY
+
+      - name: Upload results.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: ${{ runner.temp }}/results.json
+          if-no-files-found: error
 
   coverage:
     name: Coverage gate (>=90%)
@@ -58,10 +108,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Download results.json
+        uses: actions/download-artifact@v4
+        with:
+          name: conformance-results
+          path: conformance-results
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          files: conformance-results/results.json
 
       # Packagist normally auto-updates via its GitHub webhook. If you instead set
       # PACKAGIST_USERNAME / PACKAGIST_TOKEN secrets, this pings its API.
