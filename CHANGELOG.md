@@ -9,7 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-19
+
+Implements ADR-0032 (conformance packaging, results format, ASCII trim and the non-string `job` rule).
+The envelope stays at `schema_version: 1`.
+
 ### Added
+- The conformance runners cover every v1.5.0 section and write `results.json` (ADR-0032 section 2); CI
+  validates it and the release attaches it as an asset.
 - **Conformance known-gaps gate (tests/CI only, no runtime change).** `conformance-known-gaps.json` lists the
   cases the SDK does not implement yet (SQS `delay`, Kafka `backoff` tiers and `retry_republish`); each is
   actually run and reported as an honest `fail`, never written blindly. Only an assertion failure counts as a
@@ -19,6 +26,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   citing ADR-0010 / ADR-0018 (the PHP core ships producers only), not gaps.
 
 ### Changed
+- `make()` (`urn`, `trace_id`) and `accepts()` (`trace_id`) trim only the closed ASCII set (space, `\t`,
+  `\n`, `\v`, `\f`, `\r`); `trim()`'s default set (NUL, no `\f`) is no longer used (ADR-0032 section 5).
+  The set is public as `EnvelopeCodec::BLANK_CHARS`.
+- Decode: a non-string `job` is ignored with a warning and a valid string `urn` takes over; with neither,
+  decode warns and returns `[]` (poison), like malformed JSON (ADR-0032 section 6).
 - **Redis layout note (documentation, no behaviour change).** `RedisTransport`'s default layout is a plain
   `RPUSH <queue>`; it is NOT the Laravel-compatible `queues:<name>` + `:notify` layout of broker-bindings section 1.1.
   That layout is opt-in via the `$keyPrefix` constructor argument (`RedisTransport::LARAVEL_KEY_PREFIX`), and the
