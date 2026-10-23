@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Transport\SqsClient;
 use BabelQueue\Transport\SqsTransport;
 use Mockery;
@@ -184,5 +185,99 @@ final class SqsTransportTest extends TestCase
         $this->assertIsArray($captured);
 
         return $captured;
+    }
+
+    public function test_publish_with_delay_sets_delay_seconds(): void
+    {
+        $captured = null;
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldReceive('sendMessage')->once()->with(
+            Mockery::on(function (array $args) use (&$captured): bool {
+                $captured = $args;
+
+                return true;
+            }),
+        );
+
+        (new SqsTransport($client, self::URL))->publish(self::ENVELOPE, null, 900);
+
+        $this->assertSame(900, $captured['DelaySeconds']);
+    }
+
+    public function test_publish_without_delay_omits_delay_seconds(): void
+    {
+        $captured = null;
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldReceive('sendMessage')->twice()->with(
+            Mockery::on(function (array $args) use (&$captured): bool {
+                $captured = $args;
+
+                return true;
+            }),
+        );
+
+        $transport = new SqsTransport($client, self::URL);
+        $transport->publish(self::ENVELOPE);
+        $this->assertArrayNotHasKey('DelaySeconds', $captured);
+        $transport->publish(self::ENVELOPE, null, 0);
+        $this->assertArrayNotHasKey('DelaySeconds', $captured);
+    }
+
+    public function test_delay_above_900_seconds_is_rejected_without_sending(): void
+    {
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldNotReceive('sendMessage');
+
+        $this->expectException(BabelQueueException::class);
+        (new SqsTransport($client, self::URL))->publish(self::ENVELOPE, null, 901);
+    }
+
+    public function test_delay_on_a_fifo_queue_is_rejected_without_sending(): void
+    {
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldNotReceive('sendMessage');
+
+        $this->expectException(BabelQueueException::class);
+        (new SqsTransport($client, self::URL.'.fifo', fifo: true))->publish(self::ENVELOPE, null, 30);
+    }
+
+    public function test_release_changes_the_message_visibility(): void
+    {
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldReceive('changeMessageVisibility')->once()->with([
+            'QueueUrl' => self::URL,
+            'ReceiptHandle' => 'rh-1',
+            'VisibilityTimeout' => 30,
+        ]);
+        $client->shouldReceive('changeMessageVisibility')->once()->with([
+            'QueueUrl' => self::URL,
+            'ReceiptHandle' => 'rh-2',
+            'VisibilityTimeout' => 0,
+        ]);
+
+        $transport = new SqsTransport($client, self::URL);
+        $transport->release('rh-1', 30);
+        $transport->release('rh-2', -5);
+    }
+
+    public function test_release_clamps_the_visibility_timeout_to_the_sqs_maximum(): void
+    {
+        $sent = [];
+        $client = Mockery::mock(SqsClient::class);
+        $client->shouldReceive('changeMessageVisibility')->times(4)->andReturnUsing(function (array $args) use (&$sent): void {
+            $sent[$args['ReceiptHandle']] = $args['VisibilityTimeout'];
+        });
+
+        $transport = new SqsTransport($client, self::URL);
+        $transport->release('unbounded', PHP_INT_MAX);
+        $transport->release('over', 43201);
+        $transport->release('exact', 43200);
+        $transport->release('negative', PHP_INT_MIN);
+
+        $this->assertSame(
+            ['unbounded' => 43200, 'over' => 43200, 'exact' => 43200, 'negative' => 0],
+            $sent,
+        );
+        $this->assertSame(43200, SqsTransport::MAX_VISIBILITY_TIMEOUT_SECONDS);
     }
 }

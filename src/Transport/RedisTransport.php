@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Contracts\HeaderPublisher;
+use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Support\Headers;
 use Predis\ClientInterface;
 
@@ -43,6 +44,12 @@ use Predis\ClientInterface;
  * `<prefix><queue>:notify`, atomically, with the same Lua script Laravel's `RedisQueue::pushRaw()`
  * runs. {@see self::keys()} names the four structures (ready / delayed / reserved / notify). The
  * payload is the envelope (or header frame) byte-for-byte in both layouts.
+ *
+ * **Delayed publish (broker-bindings.md §1.6, ADR-0033 Konu 4; Laravel layout only).**
+ * {@see self::publishDelayed()} runs `ZADD <prefix><queue>:delayed <floor(now)+ceil(delay)> <payload>`
+ * — an integer epoch-second score ({@see self::delayedScore()}), the member being the envelope (or
+ * header frame) byte-for-byte. No `:notify` token is written: the consumer's migrate step moves the
+ * member to the ready list (and notifies) once the score is due, exactly like Laravel's `later()`.
  */
 final class RedisTransport implements HeaderPublisher
 {
@@ -64,15 +71,22 @@ final class RedisTransport implements HeaderPublisher
      */
     private const LARAVEL_PUSH_SCRIPT = "redis.call('rpush', KEYS[1], ARGV[1])\nredis.call('rpush', KEYS[2], 1)";
 
+    /** @var callable(): float */
+    private $clock;
+
     /**
      * @param  string|null  $keyPrefix  null (default) keeps the plain `RPUSH <queue>` list; a prefix
      *     such as {@see self::LARAVEL_KEY_PREFIX} switches to the Laravel-compatible layout.
+     * @param  (callable(): float)|null  $clock  current time as fractional epoch seconds (default
+     *     `microtime(true)`); the seam {@see self::publishDelayed()} computes its score from
      */
     public function __construct(
         private readonly ClientInterface $client,
         private readonly string $defaultQueue = 'default',
         private readonly ?string $keyPrefix = null,
+        ?callable $clock = null,
     ) {
+        $this->clock = $clock ?? static fn (): float => microtime(true);
     }
 
     public function publish(string $payload, ?string $queue = null): ?string
@@ -82,6 +96,41 @@ final class RedisTransport implements HeaderPublisher
         // Redis lists carry no broker-assigned id; the envelope's own meta.id is
         // the message identity. Returning null keeps the contract honest.
         return null;
+    }
+
+    /**
+     * Publish `$payload` so it becomes ready after `$delaySeconds` (broker-bindings.md §1.6):
+     * `ZADD <prefix><queue>:delayed <floor(now)+ceil(delay)> <payload>`. Needs the Laravel-compatible
+     * layout (a `$keyPrefix`) — the plain shared list has no delayed structure. No notify token is
+     * written; a non-positive delay is scored `floor(now)`. `$headers` are framed like
+     * {@see self::publishWithHeaders()} when non-empty.
+     *
+     * @param  array<string, string>  $headers
+     *
+     * @throws BabelQueueException  when the transport was built without a key prefix
+     */
+    public function publishDelayed(string $payload, float|int $delaySeconds, ?string $queue = null, array $headers = []): null
+    {
+        if ($this->keyPrefix === null) {
+            throw new BabelQueueException('Delayed Redis publish needs the Laravel-compatible layout; construct RedisTransport with a key prefix (RedisTransport::LARAVEL_KEY_PREFIX).');
+        }
+
+        $keys = self::keys($queue ?? $this->defaultQueue, $this->keyPrefix);
+        $score = self::delayedScore(($this->clock)(), $delaySeconds);
+
+        $this->client->zadd($keys['delayed'], [self::frameValue($payload, $headers) => $score]);
+
+        return null;
+    }
+
+    /**
+     * The delayed-set score (broker-bindings.md §1.6): `floor(now) + ceil(delay)` — integer epoch
+     * seconds, so a sub-second delay still waits at least until the next whole second and a
+     * fractional `$now` never rounds the due time earlier. Pure; a negative delay counts as 0.
+     */
+    public static function delayedScore(float $now, float|int $delaySeconds): int
+    {
+        return (int) floor($now) + (int) ceil(max((float) $delaySeconds, 0.0));
     }
 
     /**

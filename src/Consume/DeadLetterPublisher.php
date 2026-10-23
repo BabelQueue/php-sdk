@@ -11,6 +11,7 @@ use BabelQueue\Contracts\HasRecordKey;
 use BabelQueue\Contracts\KeyedPublisher;
 use BabelQueue\Contracts\Transport;
 use BabelQueue\DeadLetter\DeadLetter;
+use BabelQueue\DeadLetter\PoisonBody;
 use Throwable;
 
 /**
@@ -37,13 +38,13 @@ final class DeadLetterPublisher
         $queue = $message->getMeta()['queue'] ?? 'default';
         $queue = is_string($queue) && $queue !== '' ? $queue : 'default';
 
-        $poisonBody = $this->poisonBody($message);
-        $annotated = DeadLetter::annotate($poisonBody ?? $message->envelope(), $reason, $e, $queue, $message->attempts());
+        $poisonRaw = $this->poisonRaw($message);
 
-        // A poison copy is written as-is: encode() would reshape a rejected list "data" into an object.
-        $body = $poisonBody === null
-            ? EnvelopeCodec::encode($annotated)
-            : json_encode($annotated, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        // A poison copy is written byte-for-byte by PoisonBody (it cannot fail on the body: invalid UTF-8,
+        // 1e400, ...); encode() would reshape a rejected list "data" into an object.
+        $body = $poisonRaw !== null
+            ? PoisonBody::annotate($poisonRaw, $reason, $e, $queue, $message->attempts())
+            : EnvelopeCodec::encode(DeadLetter::annotate($message->envelope(), $reason, $e, $queue, $message->attempts()));
 
         // Carry the original broker record key (Kafka) onto the DLQ copy when there is one and the
         // transport can take it; a null key, or a transport without the capability, publishes as before.
@@ -58,16 +59,13 @@ final class DeadLetterPublisher
     }
 
     /**
-     * The envelope to dead-letter. A poison message (its body decodes to the empty envelope — e.g.
-     * malformed JSON, or a list `data` that decode rejects) keeps an inspectable copy when the
-     * message carries its raw body ({@see HasRawBody}): the original JSON object verbatim, else
-     * `{"raw": "<body>"}` — the same shape the Laravel adapter's DLQ writes.
+     * The raw body to dead-letter as a poison copy. A poison message (its body decodes to the empty
+     * envelope, e.g. malformed JSON or a list `data` that decode rejects) keeps an inspectable copy when
+     * the message carries its raw body ({@see HasRawBody}); see {@see PoisonBody}.
      *
      * Null when the message is not poison (or carries no raw body): its decoded envelope is used.
-     *
-     * @return array<string, mixed>|null
      */
-    private function poisonBody(ConsumedMessage $message): ?array
+    private function poisonRaw(ConsumedMessage $message): ?string
     {
         if (! $message instanceof HasRawBody) {
             return null;
@@ -78,8 +76,6 @@ final class DeadLetterPublisher
             return null;
         }
 
-        $decoded = json_decode($raw, true);
-
-        return is_array($decoded) ? $decoded : ['raw' => $raw];
+        return $raw;
     }
 }

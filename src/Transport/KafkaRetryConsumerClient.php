@@ -35,7 +35,12 @@ interface KafkaRetryConsumerClient
      * empty string is a real, empty key) — carried through the retry / dead-letter writes
      * ({@see KeyedKafkaProducer}).
      *
-     * @return array{payload: string, headers: array<string, string>, key?: string|null}|null
+     * The optional `timestamp_ms` is the record timestamp in Unix ms (rdkafka `$message->timestamp`).
+     * {@see KafkaRetryConsumer} waits until `timestamp_ms + bq-delay`, clamped into `[now, now + bq-delay]`
+     * (ADR-0033 A6); omit it (or null) and the wait runs `bq-delay` from now. Create retry topics with
+     * `message.timestamp.type=LogAppendTime` (SHOULD) so it is the broker append time.
+     *
+     * @return array{payload: string, headers: array<string, string>, key?: string|null, timestamp_ms?: int|null}|null
      */
     public function receive(): ?array;
 
@@ -49,6 +54,9 @@ interface KafkaRetryConsumerClient
      */
     public function poll(int $timeoutMs): void;
 
-    /** Commit the offset of the last received record (after it has been re-injected into the work topic). */
+    /**
+     * Commit the offset of the last received record. {@see KafkaRetryConsumer} calls it only after the
+     * record has been re-injected into the work topic and the broker acknowledged that write.
+     */
     public function commit(): void;
 }

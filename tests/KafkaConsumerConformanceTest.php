@@ -27,7 +27,8 @@ final class KafkaConsumerConformanceTest extends TestCase
             $payload = (string) json_encode([
                 'job' => 'urn:babel:orders:created',
                 'trace_id' => 'trace-1',
-                'data' => [],
+                // `data` is a JSON object on the wire; a PHP `[]` would encode as `[]` and be quarantined as poison.
+                'data' => new \stdClass(),
                 'meta' => ['id' => 'm', 'queue' => 'orders', 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
                 'attempts' => $case['body_attempts'],
             ]);

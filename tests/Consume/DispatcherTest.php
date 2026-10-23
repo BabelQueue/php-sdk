@@ -58,6 +58,66 @@ final class DispatcherTest extends TestCase
         $dispatcher($this->message('urn:babel:orders:created'));
     }
 
+    public function test_on_retry_hook_receives_the_backoff_delay_and_the_failure_is_rethrown(): void
+    {
+        $calls = [];
+        $boom = new RuntimeException('boom');
+        $dispatcher = (new Dispatcher(
+            retryBackoff: new \BabelQueue\Consume\RetryBackoff(retryBackoff: 2, multiplier: 3),
+            onRetry: function (ConsumedMessage $m, int $delay, \Throwable $e) use (&$calls): void {
+                $calls[] = [$m->attempts(), $delay, $e->getMessage()];
+            },
+        ))->on('urn:babel:orders:created', function () use ($boom): void {
+            throw $boom;
+        });
+
+        try {
+            $dispatcher($this->message('urn:babel:orders:created', 2));
+            $this->fail('the handler failure must be rethrown');
+        } catch (RuntimeException $e) {
+            $this->assertSame($boom, $e);
+        }
+
+        // attempts 2 -> n=3 -> 2 * 3^2 = 18 s
+        $this->assertSame([[2, 18, 'boom']], $calls);
+    }
+
+    public function test_on_retry_hook_is_not_called_for_a_dead_lettered_failure_nor_a_success(): void
+    {
+        $calls = 0;
+        $transport = Mockery::mock(Transport::class);
+        $transport->shouldReceive('publish')->once()->andReturn(null);
+
+        $dispatcher = (new Dispatcher(
+            'fail',
+            3,
+            new DeadLetterPublisher($transport),
+            new \BabelQueue\Consume\RetryBackoff(retryBackoff: 1),
+            function () use (&$calls): void {
+                $calls++;
+            },
+        ))->on('urn:babel:orders:created', function (ConsumedMessage $m): void {
+            if ($m->getData()['order_id'] === 7 && $m->attempts() >= 0) {
+                throw new RuntimeException('boom');
+            }
+        })->on('urn:babel:ok', static function (): void {
+        });
+
+        $dispatcher($this->message('urn:babel:orders:created', 2)); // attempts + 1 >= 3 -> dead-lettered
+        $dispatcher($this->message('urn:babel:ok'));                  // success
+
+        $this->assertSame(0, $calls);
+    }
+
+    public function test_an_unbounded_backoff_yields_php_int_max_which_the_sqs_release_clamps(): void
+    {
+        // multiplier > 1 with no max: d(n) overflows to INF after enough attempts.
+        $dispatcher = new Dispatcher(retryBackoff: new \BabelQueue\Consume\RetryBackoff(retryBackoff: 1, multiplier: 10));
+        $delay = $dispatcher->retryDelaySeconds($this->message('urn:babel:x', 400));
+
+        $this->assertSame(PHP_INT_MAX, $delay);
+    }
+
     public function test_dead_letters_a_handler_failure_at_the_attempt_cap(): void
     {
         $transport = Mockery::mock(Transport::class);

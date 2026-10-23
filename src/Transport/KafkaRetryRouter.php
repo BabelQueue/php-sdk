@@ -6,6 +6,7 @@ namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
+use BabelQueue\Exceptions\BabelQueueException;
 use Throwable;
 
 /**
@@ -53,12 +54,19 @@ use Throwable;
  */
 final class KafkaRetryRouter
 {
+    /**
+     * The RECOMMENDED retry-tier delays in ms (5 s, 30 s, 5 min, 30 min; broker-bindings.md §6.4).
+     * Opt-in: pass it (or your own list) as `$delayTiersMs`; a router built with an empty list has no
+     * tiers, so any retry or requested delay raises {@see BabelQueueException}.
+     */
+    public const DEFAULT_RETRY_TIERS_MS = [5000, 30000, 300000, 1800000];
+
     /** @var list<int> */
     private readonly array $delayTiersMs;
 
     /**
      * @param  KafkaProducer  $producer  the §6 producer seam used to republish retry / DLQ records
-     * @param  list<int>  $delayTiersMs  backoff tiers in ms (default 5s, 30s, 5m, 30m); sorted
+     * @param  list<int>  $delayTiersMs  backoff tiers in ms (default {@see self::DEFAULT_RETRY_TIERS_MS}); sorted
      *                                   ascending on construction so `retry.<n>` always means the
      *                                   n-th smallest delay, as in the Java/.NET/Node SDKs
      * @param  int  $maxAttempts  attempts before a record is dead-lettered instead of retried
@@ -69,7 +77,7 @@ final class KafkaRetryRouter
      */
     public function __construct(
         private readonly KafkaProducer $producer,
-        array $delayTiersMs = [5000, 30000, 300000, 1800000],
+        array $delayTiersMs = self::DEFAULT_RETRY_TIERS_MS,
         private readonly int $maxAttempts = 5,
         private readonly string $retryInfix = '.retry.',
         private readonly string $dlqSuffix = '.dlq',
@@ -80,20 +88,40 @@ final class KafkaRetryRouter
     }
 
     /**
-     * Route a failed work-topic record. With `$next = attempts + 1`: when `$next` would reach
-     * `maxAttempts` the record is **dead-lettered** to `<workTopic>.dlq` (returns false — exhausted);
-     * otherwise it is **retried** to the tier delay topic (`<workTopic>.retry.<tier>`) for `$next`
-     * with `bq-attempts = $next` (returns true — retried). The caller returns after this so the
-     * original record commits.
+     * Route a work-topic record. Two separate rules (broker-bindings.md §6.4 vs §6.5), never merged:
      *
-     * @return bool  true when retried, false when dead-lettered (attempts exhausted)
+     * **Retry (no `$delayMs`, §6.5)** — a failed record. With `$next = attempts + 1`: when `$next`
+     * would reach `maxAttempts` the record is **dead-lettered** to `<workTopic>.dlq` (returns false);
+     * otherwise it is **retried** to tier `n = min(attempts, N-1) + 1` — `<workTopic>.retry.<n>`,
+     * staying on the last tier once the tiers run out — with `bq-attempts = $next`, the body's
+     * `attempts` synced, `bq-delay` = that tier's own delay, `bq-original-topic` and the key kept
+     * (returns true). With no tiers configured the retry raises.
+     *
+     * **Requested delay (`$delayMs`, §6.4)** — a deliberate deferral, not a failure: the record goes to
+     * the smallest tier whose delay is >= `$delayMs` with `bq-delay` = the REQUESTED delay (the
+     * re-injection consumer then waits that long, bounded by the tier) and `attempts` unchanged; a delay
+     * above the largest tier, or any delay with no tiers configured, raises. It is never dead-lettered.
+     *
+     * The caller returns after this so the original record commits. The `retry_backoff` parameters are
+     * not applied on Kafka (ADR-0034 §9).
+     *
+     * @return bool  true when retried/deferred, false when dead-lettered (attempts exhausted)
+     *
+     * @throws BabelQueueException  no tiers configured, or `$delayMs` above the largest tier
      */
-    public function route(KafkaMessage $message, ?Throwable $e = null): bool
+    public function route(KafkaMessage $message, ?Throwable $e = null, ?int $delayMs = null): bool
     {
         $envelope = $message->envelope();
         $workTopic = $this->workTopic($message);
-        $next = $message->attempts() + 1;
         $nowMs = $this->nowMs();
+
+        if ($delayMs !== null) {
+            $this->defer($envelope, $workTopic, $delayMs, $nowMs, $message->recordKey());
+
+            return true;
+        }
+
+        $next = $message->attempts() + 1;
 
         if ($next >= $this->maxAttempts) {
             $this->deadLetter($envelope, $workTopic, $next, $e, $nowMs, $message->recordKey());
@@ -107,6 +135,14 @@ final class KafkaRetryRouter
     }
 
     /**
+     * The retry topic of tier `$n` (1-based): `<workTopic>.retry.<n>`.
+     */
+    public function retryTopic(string $workTopic, int $n): string
+    {
+        return $workTopic . $this->retryInfix . $n;
+    }
+
+    /**
      * Republish to the tier delay topic for `$next`, with `bq-attempts`/the body's `attempts` bumped
      * to `$next` and the `bq-delay` / `bq-original-topic` re-injection headers attached.
      *
@@ -114,6 +150,8 @@ final class KafkaRetryRouter
      */
     private function retry(array $envelope, string $workTopic, int $next, int $nowMs, ?string $key): void
     {
+        $this->requireTiers();
+
         $tierIndex = $this->tierIndexForAttempt($next);
         $tierMs = $this->delayTiersMs[$tierIndex];
         $envelope['attempts'] = $next;
@@ -124,12 +162,60 @@ final class KafkaRetryRouter
 
         KafkaProduce::send(
             $this->producer,
-            $workTopic . $this->retryInfix . ($tierIndex + 1),
+            $this->retryTopic($workTopic, $tierIndex + 1),
             EnvelopeCodec::encode($envelope),
             $headers,
             $nowMs,
             $key,
         );
+    }
+
+    /**
+     * Republish to the smallest tier >= `$delayMs` with `bq-delay` = `$delayMs` (the requested delay),
+     * leaving `attempts` untouched.
+     *
+     * @param  array<string, mixed>  $envelope
+     */
+    private function defer(array $envelope, string $workTopic, int $delayMs, int $nowMs, ?string $key): void
+    {
+        $this->requireTiers();
+
+        $tierIndex = null;
+        foreach ($this->delayTiersMs as $index => $tierMs) {
+            if ($tierMs >= $delayMs) {
+                $tierIndex = $index;
+                break;
+            }
+        }
+
+        if ($tierIndex === null) {
+            throw new BabelQueueException(sprintf(
+                'Requested Kafka delay %d ms is above the largest retry tier (%d ms); broker-bindings.md §6.4.',
+                $delayMs,
+                $this->delayTiersMs[count($this->delayTiersMs) - 1],
+            ));
+        }
+
+        $attempts = $envelope['attempts'] ?? 0;
+        $headers = $this->headers($envelope, is_int($attempts) ? $attempts : 0);
+        $headers['bq-delay'] = (string) $delayMs;
+        $headers['bq-original-topic'] = $workTopic;
+
+        KafkaProduce::send(
+            $this->producer,
+            $this->retryTopic($workTopic, $tierIndex + 1),
+            EnvelopeCodec::encode($envelope),
+            $headers,
+            $nowMs,
+            $key,
+        );
+    }
+
+    private function requireTiers(): void
+    {
+        if ($this->delayTiersMs === []) {
+            throw new BabelQueueException('No Kafka retry tiers are configured; pass delay tiers (e.g. KafkaRetryRouter::DEFAULT_RETRY_TIERS_MS); broker-bindings.md §6.4.');
+        }
     }
 
     /**

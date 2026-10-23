@@ -8,16 +8,19 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Transport\KafkaProducer;
 use BabelQueue\Transport\KafkaRetryConsumer;
 use BabelQueue\Transport\KafkaRetryConsumerClient;
+use BabelQueue\Transport\KeyedKafkaProducer;
+use BabelQueue\Transport\PausableKafkaRetryConsumerClient;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The §6.4 re-injection consumer: it reads a `<workTopic>.retry.<n>` record, waits the
- * `bq-delay` tier cooperatively (heartbeating the seam to keep group membership during a wait that
- * could exceed `max.poll.interval.ms`), then re-injects the decoded envelope into `bq-original-topic`
- * and commits. `bq-attempts` is NOT re-incremented (the router already bumped it). The wait is driven
- * by injected `$now`/`$sleep` seams — no real sleeping in tests.
+ * The §6.4 re-injection consumer: it reads a `<workTopic>.retry.<n>` record, waits until
+ * `record.timestamp + bq-delay` (clamped into `[now, now + bq-delay]`, ADR-0033 A6) cooperatively
+ * (heartbeating the seam to keep group membership, pausing the assignment when the client can), then
+ * re-injects the record byte-for-byte into `bq-original-topic` (A7: only `bq-delay` and
+ * `bq-original-topic` are dropped) and commits after the write. The wait is driven by injected
+ * `$now`/`$sleep` seams — no real sleeping in tests.
  */
 final class KafkaRetryConsumerTest extends TestCase
 {
@@ -80,15 +83,11 @@ final class KafkaRetryConsumerTest extends TestCase
             },
         );
 
-        $this->assertSame(5000, $slept); // waited the full bq-delay
-        // The re-injected record is back on the work topic, so the re-injection headers are dropped;
-        // the target topic is asserted via the produce() topic argument ('orders') above.
+        $this->assertSame(5000, $slept); // no record timestamp: waited the full bq-delay from now
+        // Byte-for-byte: the value is the received record, not a re-encode.
+        $this->assertSame(self::ENVELOPE, $captured['payload']);
         $this->assertArrayNotHasKey('bq-original-topic', $captured['headers']);
-        // re-injected record keeps the current bq-attempts (not re-incremented) and drops bq-delay.
-        $this->assertSame('1', $captured['headers']['bq-attempts']);
         $this->assertArrayNotHasKey('bq-delay', $captured['headers']);
-        $this->assertSame(1, json_decode($captured['payload'], true)['attempts']);
-        $this->assertSame('trace-1', $captured['headers']['bq-trace-id']); // GR-4 preserved
     }
 
     public function test_heartbeats_repeatedly_across_a_long_wait(): void
@@ -248,5 +247,151 @@ final class KafkaRetryConsumerTest extends TestCase
 
         $this->assertSame($poison, $captured['payload']); // not re-encoded from the empty envelope
         $this->assertSame(['bq-job' => 'urn:babel:orders:created', 'bq-attempts' => '2'], $captured['headers']);
+    }
+
+    public function test_reinjects_value_key_and_other_headers_byte_for_byte_dropping_only_the_two_routing_headers(): void
+    {
+        $headers = [
+            'bq-delay' => '5000',
+            'bq-original-topic' => 'orders',
+            'bq-attempts' => '2',
+            'bq-trace-id' => 'trace-1',
+            'traceparent' => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+            'x-app' => 'kept',
+        ];
+        // Deliberately not canonical JSON (spaces, key order): a decode/encode would change it.
+        $payload = '{ "job" : "urn:babel:orders:created", "attempts" : 2, "trace_id":"trace-1" }';
+
+        $client = Mockery::mock(KafkaRetryConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            ['payload' => $payload, 'headers' => $headers, 'key' => "key\x00-1", 'timestamp_ms' => 0],
+        );
+        $client->shouldReceive('commit')->once();
+
+        $sent = [];
+        $producer = Mockery::mock(KafkaProducer::class, KeyedKafkaProducer::class);
+        $producer->shouldReceive('produceKeyed')->once()->andReturnUsing(
+            static function (string $topic, string $body, array $h, ?int $ts, ?string $key) use (&$sent): void {
+                $sent = [$topic, $body, $h, $key];
+            },
+        );
+
+        $calls = 0;
+        (new KafkaRetryConsumer($client, $producer, static fn (): int => 10_000, static function (int $ms): void {}))->consume(
+            static function () use (&$calls): bool {
+                return $calls++ >= 1;
+            },
+        );
+
+        $this->assertSame('orders', $sent[0]);
+        $this->assertSame($payload, $sent[1]);
+        $this->assertSame("key\x00-1", $sent[3]);
+        $this->assertSame([
+            'bq-attempts' => '2',
+            'bq-trace-id' => 'trace-1',
+            'traceparent' => '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+            'x-app' => 'kept',
+        ], $sent[2]);
+    }
+
+    public function test_the_wait_is_computed_from_the_record_timestamp(): void
+    {
+        // Record appended 2000ms ago on a 5000ms tier: only the remaining 3000ms is waited.
+        $this->assertSame(3000, $this->waitedMs(['bq-delay' => '5000', 'bq-original-topic' => 'orders'], 8_000, 10_000));
+    }
+
+    public function test_a_record_older_than_its_tier_is_moved_without_waiting(): void
+    {
+        $this->assertSame(0, $this->waitedMs(['bq-delay' => '5000', 'bq-original-topic' => 'orders'], 1_000, 10_000));
+    }
+
+    public function test_a_future_timestamp_never_waits_longer_than_the_tier(): void
+    {
+        // Clock skew: timestamp 60s ahead. The wait is clamped to now + tier_ms, not 65s.
+        $this->assertSame(5000, $this->waitedMs(['bq-delay' => '5000', 'bq-original-topic' => 'orders'], 70_000, 10_000));
+    }
+
+    public function test_the_assignment_is_paused_for_the_wait_and_resumed_before_the_commit(): void
+    {
+        $events = [];
+        $client = Mockery::mock(PausableKafkaRetryConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            ['payload' => self::ENVELOPE, 'headers' => ['bq-delay' => '2000', 'bq-original-topic' => 'orders'], 'timestamp_ms' => 10_000],
+        );
+        $client->shouldReceive('pause')->once()->andReturnUsing(static function () use (&$events): void {
+            $events[] = 'pause';
+        });
+        $client->shouldReceive('poll')->with(0)->atLeast()->once()->andReturnUsing(static function () use (&$events): void {
+            $events[] = 'poll';
+        });
+        $client->shouldReceive('resume')->once()->andReturnUsing(static function () use (&$events): void {
+            $events[] = 'resume';
+        });
+        $client->shouldReceive('commit')->once()->andReturnUsing(static function () use (&$events): void {
+            $events[] = 'commit';
+        });
+
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->andReturnUsing(static function () use (&$events): void {
+            $events[] = 'produce';
+        });
+
+        $clock = 10_000;
+        $calls = 0;
+        (new KafkaRetryConsumer($client, $producer, static function () use (&$clock): int {
+            return $clock;
+        }, static function (int $ms) use (&$clock): void {
+            $clock += $ms;
+        }))->consume(static function () use (&$calls): bool {
+            return $calls++ >= 1;
+        });
+
+        $this->assertSame('pause', $events[0]);
+        $this->assertSame(['resume', 'produce', 'commit'], array_slice($events, -3), 'ack (produce) happens before the commit');
+    }
+
+    public function test_the_offset_is_not_committed_when_the_write_fails(): void
+    {
+        $client = Mockery::mock(KafkaRetryConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw(['bq-original-topic' => 'orders']));
+        $client->shouldNotReceive('commit');
+
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->andThrow(new \RuntimeException('broker down'));
+
+        $this->expectException(\RuntimeException::class);
+        (new KafkaRetryConsumer($client, $producer))->consume(static fn (): bool => false);
+    }
+
+    /**
+     * Runs one record and returns the total ms slept on a virtual clock.
+     *
+     * @param  array<string, string>  $headers
+     */
+    private function waitedMs(array $headers, int $timestampMs, int $nowMs): int
+    {
+        $client = Mockery::mock(KafkaRetryConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            ['payload' => self::ENVELOPE, 'headers' => $headers, 'timestamp_ms' => $timestampMs],
+        );
+        $client->shouldReceive('poll')->with(0)->zeroOrMoreTimes();
+        $client->shouldReceive('commit')->once();
+
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once();
+
+        $clock = $nowMs;
+        $slept = 0;
+        $calls = 0;
+        (new KafkaRetryConsumer($client, $producer, static function () use (&$clock): int {
+            return $clock;
+        }, static function (int $ms) use (&$clock, &$slept): void {
+            $clock += $ms;
+            $slept += $ms;
+        }))->consume(static function () use (&$calls): bool {
+            return $calls++ >= 1;
+        });
+
+        return $slept;
     }
 }

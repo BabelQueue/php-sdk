@@ -26,7 +26,11 @@ interface KafkaConsumerClient
      * empty string is a real, empty key) — carried through the retry / dead-letter writes
      * ({@see KeyedKafkaProducer}).
      *
-     * @return array{payload: string, headers: array<string, string>, key?: string|null}|null
+     * The optional `topic` is the topic the record was read from (omit it, or null, when unknown); a
+     * poison record is dead-lettered to `<topic>.dlq`, falling back to the body's `meta.queue`
+     * (default `default`) when it is absent.
+     *
+     * @return array{payload: string, headers: array<string, string>, key?: string|null, topic?: string|null}|null
      */
     public function receive(): ?array;
 

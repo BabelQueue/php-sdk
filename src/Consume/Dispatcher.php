@@ -30,6 +30,15 @@ use Throwable;
  * `maxAttempts > 0` and a publisher is set, a handler that keeps throwing is dead-lettered once the
  * reconciled attempt count would reach the cap, instead of redelivering forever.
  *
+ * **Retry backoff (ADR-0034 §9, opt-in).** Hand it a {@see RetryBackoff} and a consumer that releases
+ * a failed message with a delay asks {@see self::retryDelaySeconds()} for the seconds to pass to its
+ * transport. To have the dispatcher apply it on the consume path, pass an `$onRetry` closure: whenever a
+ * handler throws and the message is *not* dead-lettered, `$onRetry($message, $delaySeconds, $e)` runs
+ * (before the exception is rethrown for redelivery), e.g.
+ * `fn ($m, $delay) => $sqs->release($handleOf($m), $delay)` — `SqsTransport::release()` clamps an
+ * unbounded delay to SQS's 12 h limit. Without a backoff (the default) the delay is 0 — the previous
+ * behaviour. Not applied on Kafka.
+ *
  * Note on Kafka: `attempts` only grows across redeliveries when retry topics increment `bq-attempts`
  * (§6.4/§6.5), so the `maxAttempts` dead-letter cap is effective on Pulsar (native redelivery count)
  * and on Kafka once retry topics are configured.
@@ -43,7 +52,25 @@ final class Dispatcher
         private readonly string $onUnknownUrn = UnknownUrnStrategy::FAIL,
         private readonly int $maxAttempts = 0,
         private readonly ?DeadLetterPublisher $deadLetters = null,
+        private readonly ?RetryBackoff $retryBackoff = null,
+        private readonly ?\Closure $onRetry = null,
     ) {
+    }
+
+    /**
+     * Whole seconds a failed `$message` should wait before its next attempt (rounded up so a
+     * sub-second backoff never shortens): `d(n)` for `n = attempts + 1`, 0 when no
+     * {@see RetryBackoff} is configured.
+     */
+    public function retryDelaySeconds(ConsumedMessage $message): int
+    {
+        if ($this->retryBackoff === null) {
+            return 0;
+        }
+
+        $delay = $this->retryBackoff->delaySeconds($message->attempts() + 1);
+
+        return $delay >= PHP_INT_MAX ? PHP_INT_MAX : (int) ceil($delay);
     }
 
     /**
@@ -80,6 +107,10 @@ final class Dispatcher
                 $publisher->publish($message, 'failed', $e);
 
                 return;
+            }
+
+            if ($this->onRetry !== null) {
+                ($this->onRetry)($message, $this->retryDelaySeconds($message), $e);
             }
 
             throw $e;

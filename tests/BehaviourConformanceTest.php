@@ -14,8 +14,11 @@ use BabelQueue\Otel\Tracing;
 use BabelQueue\Tests\Support\ConformanceResults;
 use BabelQueue\Tests\Support\EnvelopeMessage;
 use BabelQueue\Transport\AmqpTransport;
+use BabelQueue\Consume\RetryBackoff;
+use BabelQueue\Transport\KafkaBodyClassifier;
 use BabelQueue\Transport\KafkaMessage;
 use BabelQueue\Transport\KafkaProducer;
+use BabelQueue\Transport\KeyedKafkaProducer;
 use BabelQueue\Transport\KafkaRetryRouter;
 use BabelQueue\Transport\RedisTransport;
 use BabelQueue\Transport\SqsClient;
@@ -32,14 +35,15 @@ use Predis\ClientInterface;
  * Runs the broker-free sections of the vendored cross-SDK conformance manifest and records every
  * case for `results.json` (ADR-0032): `cases`, `roundtrip`, `data_shape`, `forbidden_keys`,
  * `extension_write`, `encode_reject`, `payload_schema_unicode`, `trim`, `job_type`, `idempotency`,
- * `traceparent`, `redis`, `redis_layout`, `rabbitmq`, `delay` and `backoff`.
+ * `traceparent`, `redis`, `redis_layout`, `rabbitmq`, `delay`, `backoff`, `retry_backoff`, `redis_delay` and `kafka_poison`.
  *
  * Re-encoded output is parsed with objects kept as stdClass so the comparison is
  * type-strict ({} is not [], 1 is not 1.0 or true); object key order is ignored.
  *
- * `delay` and `backoff` are recorded as per-case skips: this package's SQS and Kafka transports are
- * publish-only reference producers (ADR-0010) with no release / retry-republish API, which the
- * accepted ADRs scope to the framework workers (ADR-0012) and `KafkaRetryRouter` (ADR-0015, ADR-0019).
+ * `delay`, `backoff`, `retry_backoff`, `redis_delay` and `kafka_poison` run against the real SQS / Kafka
+ * router / Redis producer / backoff code. The consumer-side `redis_layout` blocks run in
+ * `babelqueue/laravel` (this package has no Redis consumer; see the skip in
+ * {@see self::test_redis_layout_consumer_blocks_belong_to_the_framework_adapter()}).
  */
 final class BehaviourConformanceTest extends TestCase
 {
@@ -479,17 +483,13 @@ final class BehaviourConformanceTest extends TestCase
     }
 
     /**
-     * SQS delay (broker-bindings.md section 3.4): the case is run against the real `SqsTransport` and a
-     * recording client. The transport has no way to request a delay today (`publish()` takes no
-     * `$delaySeconds`), so every case fails an assertion and is listed in `conformance-known-gaps.json`
-     * (follow-up: DEVAM.md "Açık işler"). Once the parameter exists the evaluator checks the real
-     * `DelaySeconds` / rejection, so a listed case that starts passing is flagged as a stale gap.
+     * SQS delay (broker-bindings.md section 3.4): each case runs against the real `SqsTransport` and a
+     * recording client; a delay above 900 s, or any per-message delay on a FIFO queue, raises
+     * `BabelQueueException` and sends nothing.
      */
     public function test_sqs_delay(): void
     {
         ConformanceResults::each('delay', function (array $case): void {
-            self::assertMethodParameter(SqsTransport::class, 'publish', 'delaySeconds', 'the transport cannot be asked for a DelaySeconds');
-
             $fifo = $case['queue_type'] === 'fifo';
             $sent = [];
             $client = Mockery::mock(SqsClient::class);
@@ -518,16 +518,10 @@ final class BehaviourConformanceTest extends TestCase
         });
     }
 
-    /**
-     * SQS release (broker-bindings.md section 3.5): needs `ChangeMessageVisibility` on the client seam and a
-     * release on the transport; neither exists, so the cases are listed known gaps (see {@see test_sqs_delay()}).
-     */
+    /** SQS release (broker-bindings.md section 3.5): `ChangeMessageVisibility` with the requested timeout. */
     public function test_sqs_release_visibility(): void
     {
         ConformanceResults::each('delay', function (array $case): void {
-            self::assertTrue((new \ReflectionClass(SqsClient::class))->hasMethod('changeMessageVisibility'), 'the SqsClient seam has no changeMessageVisibility operation');
-            self::assertTrue(method_exists(SqsTransport::class, 'release'), 'SqsTransport has no release()');
-
             $calls = [];
             $client = Mockery::mock(SqsClient::class);
             $client->shouldReceive('changeMessageVisibility')->once()->andReturnUsing(static function (array $args) use (&$calls): mixed {
@@ -543,76 +537,214 @@ final class BehaviourConformanceTest extends TestCase
     }
 
     /**
-     * Kafka backoff tiers (broker-bindings.md section 6.4): the case is run against the real
-     * `KafkaRetryRouter`. `route()` picks the tier by attempts and takes no requested delay (no
-     * `$delayMs`), so every case fails an assertion and is a listed known gap; once the parameter exists the
-     * evaluator checks the real topic and headers, so a case that starts passing is flagged as stale.
+     * Kafka requested-delay rule (broker-bindings.md section 6.4): the smallest tier that covers the
+     * requested delay, `bq-delay` echoing the REQUESTED delay, `attempts` untouched; a delay above the
+     * largest tier is rejected. Run against the real `KafkaRetryRouter`.
      */
     public function test_kafka_backoff_tiers(): void
     {
-        ConformanceResults::each('backoff', fn (array $case) => $this->evaluateKafkaTier($case, (int) $case['delay_ms'], 0));
+        ConformanceResults::each('backoff', function (array $case): void {
+            $this->evaluateKafkaRoute($case, 0, $case['expect'], (int) $case['delay_ms']);
+        });
     }
 
-    /** Kafka release/retry republish (section 6.5); same evaluator and gap rules as {@see test_kafka_backoff_tiers()}. */
+    /** Kafka release/retry republish (section 6.5): the tier follows the attempts, not a requested delay. */
     public function test_kafka_retry_republish(): void
     {
-        ConformanceResults::each('backoff', fn (array $case) => $this->evaluateKafkaTier($case, (int) $case['release_delay_ms'], (int) $case['attempts']), 'retry_republish');
+        ConformanceResults::each('backoff', function (array $case): void {
+            $this->evaluateKafkaRoute($case, (int) $case['attempts'], $case['expect'], null);
+        }, 'retry_republish');
+    }
+
+    /** `n = min(attempts_before, N-1) + 1`, staying on the last tier once the tiers run out; the record key is kept. */
+    public function test_kafka_retry_attempt_tier(): void
+    {
+        ConformanceResults::each('backoff', function (array $case): void {
+            $this->evaluateKafkaRoute($case, (int) $case['attempts_before'], $case['expect'], null, $case['key'] ?? null);
+        }, 'retry_attempt_tier');
+    }
+
+    /** Retry topic naming (section 6.4): `<work_topic>.retry.<n>`, n 1-based. */
+    public function test_kafka_topic_names(): void
+    {
+        ConformanceResults::each('backoff', function (array $case): void {
+            $router = new KafkaRetryRouter(Mockery::mock(KafkaProducer::class));
+            self::assertSame($case['expect_topic'], $router->retryTopic((string) $case['work_topic'], (int) $case['n']));
+        }, 'topic_names');
+    }
+
+    /** The RECOMMENDED tier list is exposed as `DEFAULT_RETRY_TIERS_MS` (section 6.4). */
+    public function test_kafka_default_tiers(): void
+    {
+        ConformanceResults::each('backoff', static function (array $case): void {
+            self::assertSame('DEFAULT_RETRY_TIERS_MS', $case['constant']);
+            self::assertSame($case['expect'], KafkaRetryRouter::DEFAULT_RETRY_TIERS_MS);
+        }, 'default_tiers');
     }
 
     /**
-     * @param  array<string, mixed>  $case
+     * Kafka poison classification (ADR-0034 section 10, broker-bindings.md section 6.5): the same
+     * body-to-verdict table every SDK implements; `no_identity` and `poison` share one fate on Kafka.
      */
-    private function evaluateKafkaTier(array $case, int $delayMs, int $attempts): void
+    public function test_kafka_poison_classification(): void
     {
-        self::assertMethodParameter(KafkaRetryRouter::class, 'route', 'delayMs', 'the router cannot be asked for a delay');
-
-        $sent = [];
-        $producer = Mockery::mock(KafkaProducer::class);
-        $producer->shouldReceive('produce')->zeroOrMoreTimes()->andReturnUsing(static function (string $topic, string $payload, array $headers) use (&$sent): void {
-            $sent[] = ['topic' => $topic, 'payload' => $payload, 'headers' => $headers];
+        ConformanceResults::each('kafka_poison', static function (array $case): void {
+            self::assertSame($case['expect'], KafkaBodyClassifier::classify((string) $case['body']), (string) $case['name']);
         });
-        $router = new KafkaRetryRouter($producer, $case['retry_tiers_ms']);
+    }
+
+    /**
+     * Retry backoff (ADR-0034 section 9): `d(n) = min(max, base * multiplier^(n-1))`, `full` jitter
+     * draws `uniform(0, d(n))`. Defaults give 0 (today's behaviour). The `RetryBackoff` value object is
+     * the formula the consume path ({@see \BabelQueue\Consume\Dispatcher}) applies.
+     */
+    public function test_retry_backoff_formula(): void
+    {
+        ConformanceResults::each('retry_backoff', static function (array $case): void {
+            $backoff = new RetryBackoff(
+                (float) $case['retry_backoff'],
+                (float) $case['retry_backoff_multiplier'],
+                (float) $case['retry_backoff_max'],
+                (string) $case['retry_jitter'],
+            );
+            $n = (int) $case['n'];
+
+            if (array_key_exists('expect_delay_seconds', $case)) {
+                self::assertEqualsWithDelta((float) $case['expect_delay_seconds'], $backoff->delaySeconds($n), 1e-9, (string) $case['name']);
+
+                return;
+            }
+
+            $min = (float) $case['expect_delay_range_seconds']['min'];
+            $max = (float) $case['expect_delay_range_seconds']['max'];
+            for ($draw = 0; $draw < 50; $draw++) {
+                $delay = $backoff->delaySeconds($n);
+                self::assertGreaterThanOrEqual($min, $delay, (string) $case['name'] . ': jittered delay below range');
+                self::assertLessThanOrEqual($max, $delay, (string) $case['name'] . ': jittered delay above range');
+            }
+        });
+    }
+
+    /** Redis delayed score (section 1.6): `floor(now) + ceil(delay)`, integer epoch seconds. */
+    public function test_redis_delay_score(): void
+    {
+        ConformanceResults::each('redis_delay', static function (array $case): void {
+            self::assertSame($case['expect_score'], RedisTransport::delayedScore((float) $case['now'], $case['delay']), (string) $case['name']);
+        });
+    }
+
+    /**
+     * The `delayed_score` behavioural block, run against the real `RedisTransport::publishDelayed()`
+     * on a fake client (the producer side needs no server): one `ZADD` on the `:delayed` key, the
+     * member the body byte for byte, the integer score, and no notify token.
+     */
+    public function test_redis_layout_delayed_score(): void
+    {
+        ConformanceResults::each('redis_layout', function (array $case): void {
+            $step = $case['steps'][0];
+            self::assertSame('push_delayed', $step['op']);
+
+            $added = [];
+            $client = Mockery::mock(ClientInterface::class);
+            $client->shouldNotReceive('eval');
+            $client->shouldNotReceive('rpush');
+            $client->shouldReceive('zadd')->once()->andReturnUsing(static function (string $key, array $members) use (&$added): int {
+                $added[] = [$key, $members];
+
+                return 1;
+            });
+
+            $transport = new RedisTransport($client, 'default', RedisTransport::LARAVEL_KEY_PREFIX, static fn (): float => (float) $step['now']);
+            $transport->publishDelayed((string) $step['body'], $step['delay'], (string) $case['queue']);
+
+            self::assertCount(1, $added);
+            self::assertSame('queues:' . $case['queue'] . ':delayed', $added[0][0]);
+            $expected = $step['expect']['delayed'][0];
+            self::assertSame([(string) $expected['member'] => $expected['score']], $added[0][1], 'member and integer score');
+        }, 'delayed_score');
+    }
+
+    /**
+     * The remaining behavioural `redis_layout` blocks exercise a Redis CONSUMER (reserve, migrate,
+     * release, sweep). `php-sdk` ships a publish-only `RedisTransport` (ADR-0010: PHP consumes through
+     * the framework workers), so the consumer behaviour is run by `babelqueue/laravel` against its real
+     * `BabelQueueRedisQueue`. Here the blocks are recorded as skips, which is only valid while
+     * `BQ_REQUIRE_REDIS` is unset (the manifest runner contract); with it set they fail loudly.
+     */
+    public function test_redis_layout_consumer_blocks_belong_to_the_framework_adapter(): void
+    {
+        $subs = ['migrate', 'reserve', 'pcall_poison', 'release', 'processing_sweep', 'processing_token', 'late_ack', 'identical_copies', 'retry_after_null', 'lrem_count', 'malformed_member', 'orphan', 'legacy_release_gate', 'legacy_dlq_gate'];
+
+        if (getenv('BQ_REQUIRE_REDIS') !== false && getenv('BQ_REQUIRE_REDIS') !== '') {
+            self::fail('BQ_REQUIRE_REDIS is set but php-sdk has no Redis consumer to run the behavioural redis_layout blocks (' . implode(', ', $subs) . '); they run in babelqueue/laravel (ADR-0033 A12, ADR-0010).');
+        }
+
+        foreach ($subs as $sub) {
+            ConformanceResults::skipAll('redis_layout', 'ADR-0010/ADR-0033 A12: php-sdk has no Redis consumer; the consumer behaviour is run by babelqueue/laravel against live Redis', $sub);
+        }
+
+        $this->addToAssertionCount(1);
+    }
+
+    /**
+     * Runs one router case. `$delayMs` null = the retry/release entry point (tier from the attempts),
+     * otherwise the requested-delay rule. The router gets a `maxAttempts` large enough that a high
+     * `attempts` still retries (the default 5 would dead-letter it).
+     *
+     * @param  array<string, mixed>  $case
+     * @param  array<string, mixed>|string  $expect
+     */
+    private function evaluateKafkaRoute(array $case, int $attempts, array|string $expect, ?int $delayMs, ?string $key = null): void
+    {
+        $sent = [];
+        $producer = Mockery::mock(KafkaProducer::class, KeyedKafkaProducer::class);
+        $producer->shouldReceive('produce')->zeroOrMoreTimes()->andReturnUsing(static function (string $topic, string $payload, array $headers, ?int $timestampMs = null) use (&$sent): void {
+            $sent[] = ['topic' => $topic, 'payload' => $payload, 'headers' => $headers, 'key' => null];
+        });
+        $producer->shouldReceive('produceKeyed')->zeroOrMoreTimes()->andReturnUsing(static function (string $topic, string $payload, array $headers, ?int $timestampMs, ?string $recordKey) use (&$sent): void {
+            $sent[] = ['topic' => $topic, 'payload' => $payload, 'headers' => $headers, 'key' => $recordKey];
+        });
+
+        $router = new KafkaRetryRouter($producer, $case['retry_tiers_ms'], maxAttempts: 1000);
         $message = new KafkaMessage([
             'job' => 'urn:acme:orders:created',
             'trace_id' => 'trace-1',
             'data' => ['order_id' => 1],
             'meta' => ['id' => 'msg-1', 'queue' => $case['work_topic'], 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
             'attempts' => $attempts,
-        ]);
+        ], key: $key);
 
-        if ($case['expect'] === 'reject') {
+        if ($expect === 'reject') {
             try {
-                $router->route($message, null, delayMs: $delayMs);
+                $router->route($message, null, $delayMs);
                 self::fail('the route must raise BabelQueueException');
             } catch (BabelQueueException) {
-                self::assertSame([], $sent, 'a rejected delay must not produce anything');
+                self::assertSame([], $sent, 'a rejected route must not produce anything');
             }
 
             return;
         }
 
-        $router->route($message, null, delayMs: $delayMs);
+        self::assertTrue($router->route($message, null, $delayMs), 'the record must be retried, not dead-lettered');
         self::assertCount(1, $sent);
 
-        // The tier is only observable through the topic; this SDK numbers `<topic>.retry.<n>` 1-based by ascending delay.
         $tiers = $case['retry_tiers_ms'];
         sort($tiers);
-        $tierNumber = array_search($case['expect']['tier_ms'], $tiers, true);
+        $tierNumber = array_search($expect['tier_ms'], $tiers, true);
         self::assertNotFalse($tierNumber, 'fixture consistency: tier_ms is one of retry_tiers_ms');
         self::assertSame($case['work_topic'] . '.retry.' . ($tierNumber + 1), $sent[0]['topic'], 'tier topic');
-        foreach ($case['expect']['headers'] as $header => $value) {
+        if (isset($expect['topic'])) {
+            self::assertSame($expect['topic'], $sent[0]['topic'], 'expected topic');
+        }
+        foreach ($expect['headers'] ?? [] as $header => $value) {
             self::assertSame($value, $sent[0]['headers'][$header] ?? null, 'header ' . $header);
         }
-        if (isset($case['expect']['body_attempts'])) {
-            self::assertSame($case['expect']['body_attempts'], EnvelopeCodec::decode($sent[0]['payload'])['attempts'] ?? null, 'body attempts');
+        if (isset($expect['body_attempts'])) {
+            self::assertSame($expect['body_attempts'], EnvelopeCodec::decode($sent[0]['payload'])['attempts'] ?? null, 'body attempts');
         }
-    }
-
-    /** Fails an assertion (an expected known gap, never an error) when `$class::$method()` lacks the named parameter. */
-    private static function assertMethodParameter(string $class, string $method, string $parameter, string $why): void
-    {
-        $names = array_map(static fn (\ReflectionParameter $p): string => $p->getName(), (new \ReflectionMethod($class, $method))->getParameters());
-        self::assertContains($parameter, $names, $class . '::' . $method . '() has no $' . $parameter . ' parameter: ' . $why);
+        if (array_key_exists('key', $expect)) {
+            self::assertSame($expect['key'], $sent[0]['key'], 'record key kept byte for byte');
+        }
     }
 
     /**

@@ -11,6 +11,8 @@ use BabelQueue\Exceptions\UnknownUrnException;
 use BabelQueue\Transport\KafkaConsumer;
 use BabelQueue\Transport\KafkaConsumerClient;
 use BabelQueue\Transport\KafkaMessage;
+use BabelQueue\Transport\KafkaProducer;
+use BabelQueue\Transport\KeyedKafkaProducer;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -282,5 +284,257 @@ final class KafkaConsumerTest extends TestCase
         // The gate does not decode the body, so `meta.queue` is unknown and the record goes to the
         // default dead-letter queue rather than `<queue>.dlq`.
         $this->assertSame('default.dlq', $published[1]);
+    }
+    // -- poison / no_identity -> <topic>.dlq with reason poison (ADR-0034 §10) ----------
+
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function unusableBodies(): array
+    {
+        return [
+            'invalid json' => ['{not json'],
+            'empty body' => [''],
+            'trailing data' => ['{"job":"urn:babel:orders:created"} x'],
+            'not an object' => ['[1,2,3]'],
+            'wrong-typed member' => ['{"job":"urn:babel:orders:created","attempts":"3"}'],
+            'wrong-typed nested meta' => ['{"job":"urn:babel:orders:created","meta":{"id":7}}'],
+            'no identity (empty object)' => ['{}'],
+            'no identity (only data)' => ['{"data":{"a":1}}'],
+            'no identity (literal null)' => ['null'],
+            'blank identity' => ['{"job":"  ","data":{}}'],
+        ];
+    }
+
+    /**
+     * A recording keyed producer + a commit log, so ordering (DLQ write before commit) is asserted.
+     *
+     * @param  list<string>  $log
+     * @return array{0: KeyedKafkaProducer, 1: object}
+     */
+    private function recordingProducer(array &$log): array
+    {
+        $recorder = new class($log) implements KeyedKafkaProducer {
+            /** @var list<array{topic: string, payload: string, headers: array<string, string>, key: ?string}> */
+            public array $records = [];
+
+            /** @param list<string> $log */
+            public function __construct(private array &$log)
+            {
+            }
+
+            public function produce(string $topic, string $payload, array $headers, ?int $timestampMs = null): void
+            {
+                $this->produceKeyed($topic, $payload, $headers, $timestampMs, null);
+            }
+
+            public function produceKeyed(string $topic, string $payload, array $headers, ?int $timestampMs, ?string $key): void
+            {
+                $this->log[] = 'produce';
+                $this->records[] = ['topic' => $topic, 'payload' => $payload, 'headers' => $headers, 'key' => $key];
+            }
+        };
+
+        return [$recorder, $recorder];
+    }
+
+    #[DataProvider('unusableBodies')]
+    public function test_an_unusable_body_is_dead_lettered_as_poison_then_committed_and_never_handled(string $body): void
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn([
+            'payload' => $body,
+            'headers' => ['bq-attempts' => '2', 'traceparent' => '00-aa-bb-01'],
+            'key' => 'order-7',
+            'topic' => 'orders',
+        ]);
+        $client->shouldReceive('commit')->once()->andReturnUsing(function () use (&$log): void {
+            $log[] = 'commit';
+        });
+
+        $handled = false;
+        $consumer = new KafkaConsumer($client, $producer);
+        $stops = 0;
+        $consumer->consume(static function () use (&$handled): void {
+            $handled = true;
+        }, static function () use (&$stops): bool {
+            return $stops++ >= 1;
+        });
+
+        $this->assertFalse($handled, 'the handler must not be called for an unusable body');
+        $this->assertSame(['produce', 'commit'], $log, 'DLQ write first, offset commit after');
+        $this->assertCount(1, $recorder->records);
+
+        $record = $recorder->records[0];
+        $this->assertSame('orders.dlq', $record['topic']);
+        $this->assertSame('order-7', $record['key']);
+        $this->assertSame(['bq-attempts' => '2', 'traceparent' => '00-aa-bb-01'], $record['headers']);
+
+        $dlq = json_decode($record['payload'], true);
+        $this->assertSame('poison', $dlq['dead_letter']['reason']);
+        $this->assertSame('orders', $dlq['dead_letter']['original_queue']);
+        $this->assertSame(2, $dlq['dead_letter']['attempts']);
+        $this->assertSame('php', $dlq['dead_letter']['lang']);
+    }
+
+    public function test_a_poison_object_body_keeps_its_members_and_a_non_object_is_wrapped_as_raw(): void
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->twice()->andReturn(
+            $this->raw([], '{"data":{"a":1},"trace_id":"t-9"}'),
+            $this->raw([], '{broken'),
+        );
+        $client->shouldReceive('commit')->twice();
+
+        $consumer = new KafkaConsumer($client, $producer);
+        $this->assertNull($consumer->receive());
+        $this->assertNull($consumer->receive());
+
+        $first = json_decode($recorder->records[0]['payload'], true);
+        $this->assertSame(['a' => 1], $first['data']);
+        $this->assertSame('t-9', $first['trace_id']);
+        $this->assertArrayNotHasKey('raw', $first);
+
+        $second = json_decode($recorder->records[1]['payload'], true);
+        $this->assertSame('{broken', $second['raw']);
+        $this->assertSame('poison', $second['dead_letter']['reason']);
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: bool}> body, whether it is carried as `raw` (else spliced as an object)
+     */
+    public static function unencodableBodies(): array
+    {
+        return [
+            'invalid UTF-8' => ["\xff\xfe{bad", true],
+            'invalid UTF-8 inside an object' => ["{\"job\":\"urn:babel:a:b\",\"data\":\"\xff\"}", true],
+            'overflowing number (INF)' => ['{"job":"urn:babel:a:b","attempts":"x","data":{"n":1e400}}', false],
+            'overflowing number without identity' => ['{"data":{"n":1e400}}', false],
+        ];
+    }
+
+    #[DataProvider('unencodableBodies')]
+    public function test_an_unencodable_poison_body_is_dead_lettered_byte_exact_and_committed_without_throwing(string $body, bool $wrapped): void
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw([], $body));
+        $client->shouldReceive('commit')->once()->andReturnUsing(function () use (&$log): void {
+            $log[] = 'commit';
+        });
+
+        $this->assertNull((new KafkaConsumer($client, $producer))->receive());
+
+        $this->assertSame(['produce', 'commit'], $log, 'written to the DLQ and committed: the partition must not wedge');
+        $payload = $recorder->records[0]['payload'];
+        $this->assertSame('default.dlq', $recorder->records[0]['topic']);
+
+        $dlq = json_decode($payload, true);
+        $this->assertIsArray($dlq, 'the DLQ record is valid JSON');
+        $this->assertSame('poison', $dlq['dead_letter']['reason']);
+
+        if ($wrapped) {
+            $this->assertSame('base64', $dlq['raw_encoding'] ?? null);
+            $this->assertSame($body, base64_decode($dlq['raw'], true), 'every original byte is recoverable');
+        } else {
+            $this->assertStringContainsString(substr($body, 1, -1), $payload, 'the original bytes are carried verbatim');
+        }
+    }
+
+    public function test_a_poison_copy_preserves_empty_objects_and_big_integers(): void
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+        $body = '{"job":"","data":{},"meta":{"ext":{},"big":12345678901234567890}}';
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw([], $body));
+        $client->shouldReceive('commit')->once();
+
+        (new KafkaConsumer($client, $producer))->receive();
+
+        $payload = $recorder->records[0]['payload'];
+        $this->assertStringContainsString('"data":{}', $payload, '{} must not become []');
+        $this->assertStringContainsString('"ext":{}', $payload);
+        $this->assertStringContainsString('"big":12345678901234567890', $payload, 'integers beyond int64 must stay exact');
+        $this->assertSame('poison', json_decode($payload, false)->dead_letter->reason);
+    }
+
+    public function test_the_dlq_topic_falls_back_to_the_body_queue_then_default_without_a_client_topic(): void
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->twice()->andReturn(
+            $this->raw([], '{"meta":{"queue":"billing"}}'),
+            $this->raw([], '{}'),
+        );
+        $client->shouldReceive('commit')->twice();
+
+        $consumer = new KafkaConsumer($client, $producer);
+        $consumer->receive();
+        $consumer->receive();
+
+        $this->assertSame('billing.dlq', $recorder->records[0]['topic']);
+        $this->assertSame('default.dlq', $recorder->records[1]['topic']);
+        $this->assertNull($recorder->records[1]['key']);
+    }
+
+    public function test_an_unusable_body_without_a_dlq_producer_is_committed_and_dropped(): void
+    {
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw([], '{not json'));
+        $client->shouldReceive('commit')->once();
+
+        $this->assertNull((new KafkaConsumer($client))->receive());
+    }
+
+    public function test_a_failing_dlq_write_leaves_the_poison_record_uncommitted(): void
+    {
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->andThrow(new RuntimeException('broker down'));
+
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw([], '{not json'));
+        $client->shouldNotReceive('commit');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('broker down');
+
+        (new KafkaConsumer($client, $producer))->receive();
+    }
+
+    public function test_a_valid_envelope_is_delivered_and_never_dead_lettered_when_a_dlq_producer_is_set(): void
+    {
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldNotReceive('produce');
+
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw());
+        $client->shouldNotReceive('commit');
+
+        $message = (new KafkaConsumer($client, $producer))->receive();
+
+        $this->assertSame('urn:babel:orders:created', $message?->getUrn());
+    }
+
+    public function test_the_version_gate_still_wins_over_the_poison_check(): void
+    {
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldNotReceive('produce');
+
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw(['bq-schema-version' => '2'], '{not json'));
+        $client->shouldNotReceive('commit');
+
+        $message = (new KafkaConsumer($client, $producer))->receive();
+
+        $this->assertNotNull($message);
+        $this->assertSame(KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . '2', $message->getUrn());
     }
 }

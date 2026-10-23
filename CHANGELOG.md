@@ -9,6 +9,61 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0033 / ADR-0034 for the PHP core against conformance v1.6.0. The envelope stays at
+`schema_version: 1`; `conformance-known-gaps.json` is now empty.
+
+### Fixed
+- **Kafka poison quarantine never throws (ADR-0034 section 10).** `KafkaConsumer` wrote the poison copy through
+  `json_encode`, which threw on invalid UTF-8 or `1e400` and crash-looped the worker without committing. The copy is
+  now built by `DeadLetter\PoisonBody`: a JSON-object body is written byte-for-byte with the `dead_letter` block
+  spliced in (so `{}` stays `{}` and big integers stay exact); anything else is wrapped as `{"raw": ...}`, with
+  non-UTF-8 bytes as base64 plus `raw_encoding: "base64"` (additive, ADR-0009). `Consume\DeadLetterPublisher`
+  uses the same helper.
+
+### Added
+- `SqsTransport::publish($payload, $queue, $delaySeconds)` sets `DelaySeconds` (max 900; a `BabelQueueException`
+  on FIFO queues or above 900) and `SqsTransport::release()` issues `ChangeMessageVisibility`.
+  **`SqsClient` gains a `changeMessageVisibility()` method** - custom `SqsClient` adapters must implement it.
+- `RedisTransport::publishDelayed()` writes `ZADD <prefix><queue>:delayed <floor(now)+ceil(delay)> <payload>`
+  (integer epoch seconds, no notify token); `RedisTransport::delayedScore()` exposes the pure score rule.
+- `KafkaRetryRouter::DEFAULT_RETRY_TIERS_MS` (`[5000, 30000, 300000, 1800000]`, opt-in) and an optional
+  `$delayMs` on `KafkaRetryRouter::route()` for a deliberate deferral (smallest sufficient tier, `bq-delay` =
+  the requested delay; a delay above the largest tier raises).
+- `PausableKafkaRetryConsumerClient`: when the consumer client supports it, `KafkaRetryConsumer` waits with
+  pause/resume so the poll loop is not blocked.
+- `KafkaBodyClassifier` classifies a raw record value as `ok` / `no_identity` / `poison` exactly as the
+  `kafka_poison` conformance section requires.
+- **`KafkaConsumer` quarantines unusable bodies (ADR-0034 section 10).** After the section 6.7 version gate, a
+  record whose body has no usable identity (`no_identity` and `poison` share one fate) is never handed to the
+  handler: with the new optional `?KafkaProducer $deadLetterProducer` / `$dlqSuffix` constructor arguments it
+  is written to `<topic>.dlq` with `dead_letter.reason = poison` (original key and headers preserved) and then
+  committed; without a producer it degrades to commit + drop (section 6.5). `receive()` returns `null` for such
+  a record. A failing DLQ write does not commit and the exception propagates, so the record is redelivered.
+  `KafkaConsumerClient::receive()` may now return an optional `topic` (fallback: body `meta.queue`, then
+  `default`).
+- `SqsTransport::MAX_VISIBILITY_TIMEOUT_SECONDS` (43 200).
+- `Consume\Dispatcher` takes an optional `$onRetry` closure `(ConsumedMessage, int $delaySeconds, Throwable)`,
+  called when a handler throws and the message is not dead-lettered, so a transport release can apply the
+  backoff (e.g. `SqsTransport::release()`); without it nothing changes.
+- Opt-in retry backoff for the consume path (ADR-0034 section 9): `Consume\RetryBackoff`
+  (`retry_backoff`, `retry_backoff_multiplier`, `retry_backoff_max`, `retry_jitter` = `none|full`) and
+  `Dispatcher::retryDelaySeconds()`. Defaults (no backoff) keep the previous behaviour. Not applied on Kafka.
+
+### Changed
+- `SqsTransport::release()` clamps the visibility timeout to SQS's 12 h limit (an unbounded backoff delay
+  would otherwise be rejected by SQS) and never sends a negative value.
+- **`KafkaRetryConsumer` follows broker-bindings.md section 6.4.** The wait target is
+  `record.timestamp + tier_ms` clamped to `[now, now + tier_ms]` (a record already older than its tier moves
+  at once), and the record is re-injected to `bq-original-topic` byte-for-byte (value and key are not decoded
+  or re-encoded); only `bq-delay` and `bq-original-topic` are dropped, every other header (including
+  `traceparent`) is kept. The offset is committed only after the write is acknowledged.
+  `KafkaRetryConsumerClient::receive()` may now return `timestamp_ms` and `key`.
+- Retry topics are `<topic>.retry.<n>` with `n` the 1-based tier index and the attempt-to-tier rule
+  `min(attempts_before, N-1) + 1` (already on `main`; see the 1.x migration note below). **Old
+  `.retry.<delayMs>` topics must be drained before upgrading.**
+- Recommended operations setting: create the retry topics with `message.timestamp.type=LogAppendTime` so the
+  wait target is not skewed by producer clocks (SHOULD, section 6.4).
+
 ## [1.24.0] - 2026-10-19
 
 Implements ADR-0032 (conformance packaging, results format, ASCII trim and the non-string `job` rule).

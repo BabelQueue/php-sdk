@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\DeadLetter\PoisonBody;
 use Throwable;
 
 /**
@@ -38,6 +39,17 @@ use Throwable;
  * existing unknown-URN path (`on_unknown_urn`: dead-letter / ...), and the error names the rejected
  * version. The envelope of such a message is only `['raw' => <body>, 'attempts' => n]`, so a
  * dead-letter copy keeps the producer's bytes in the same `{"raw": ...}` shape as a poison body.
+ *
+ * **Poison and identity-less bodies (ADR-0034 §10, §6.5).** After the version gate and before the
+ * handler sees anything, the raw value is classified with {@see KafkaBodyClassifier}. A body that is
+ * not {@see KafkaBodyClassifier::OK} (undecodable, wrong-typed member, or no `job`/`urn` identity)
+ * never reaches the handler: it is written to `<topic>.dlq` with `dead_letter.reason = poison` (the
+ * raw JSON object verbatim, else `{"raw": "<body>"}`; original headers and record key carried
+ * byte-for-byte) and only then is its offset committed. {@see self::receive()} returns null for such
+ * a record, exactly as for an idle poll, so {@see self::consume()} simply moves on. DLQ routing is
+ * opt-in: with no `$deadLetterProducer` the record degrades to commit-and-drop (§6.5), so it is never
+ * redelivered in a loop. If the DLQ write itself throws, the offset is **not** committed and the
+ * exception propagates (a later commit would otherwise silently skip the record).
  */
 final class KafkaConsumer
 {
@@ -47,15 +59,24 @@ final class KafkaConsumer
      */
     public const UNSUPPORTED_SCHEMA_URN_PREFIX = 'babelqueue:unsupported-schema-version:';
 
+    /**
+     * @param  KafkaProducer|null  $deadLetterProducer  where poison / identity-less records are dead-lettered
+     *                                                  (a {@see KeyedKafkaProducer} also carries the record key);
+     *                                                  null = commit-and-drop (§6.5, DLQ is opt-in)
+     * @param  string  $dlqSuffix  the dead-letter-topic suffix (`<topic>.dlq`)
+     */
     public function __construct(
         private readonly KafkaConsumerClient $client,
+        private readonly ?KafkaProducer $deadLetterProducer = null,
+        private readonly string $dlqSuffix = '.dlq',
     ) {
     }
 
     /**
      * Poll and decode the next record, with §6 `attempts` reconciled onto the envelope (the
      * `bq-attempts` header wins, else the body's own), or null if none arrived within the poll
-     * timeout.
+     * timeout. A poison / identity-less record is dead-lettered and committed here (see the class
+     * docblock) and also yields null: it is never handed to the caller.
      */
     public function receive(): ?KafkaMessage
     {
@@ -82,6 +103,13 @@ final class KafkaConsumer
             );
         }
 
+        // ADR-0034 §10: poison and no_identity share one fate - DLQ with reason `poison`, no handler.
+        if (KafkaBodyClassifier::classify($raw['payload']) !== KafkaBodyClassifier::OK) {
+            $this->quarantine($raw);
+
+            return null;
+        }
+
         $envelope = EnvelopeCodec::decode($raw['payload']);
 
         // §6: the bq-attempts header is authoritative (Kafka has no native delivery count); fall
@@ -94,6 +122,38 @@ final class KafkaConsumer
         // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
         // record's original work topic (bq-original-topic) across hops.
         return new KafkaMessage($envelope, $raw['headers'], $raw['payload'], null, $raw['key'] ?? null);
+    }
+
+    /**
+     * Dead-letter a poison / identity-less record (when a producer is configured) and commit its
+     * offset. The DLQ write comes first; if it throws, nothing is committed.
+     *
+     * @param  array{payload: string, headers: array<string, string>, key?: string|null, topic?: string|null}  $raw
+     */
+    private function quarantine(array $raw): void
+    {
+        if ($this->deadLetterProducer !== null) {
+            $topic = $raw['topic'] ?? null;
+            if (! is_string($topic) || $topic === '') {
+                $topic = PoisonBody::queueHint($raw['payload']) ?? 'default';
+            }
+
+            $headerAttempts = $raw['headers']['bq-attempts'] ?? null;
+            $attempts = is_string($headerAttempts) && $headerAttempts !== '' ? (int) $headerAttempts : 0;
+
+            // The copy is built by PoisonBody, which cannot fail on the body (invalid UTF-8, 1e400, ...):
+            // a deterministic encode error must not stop the commit below, or the partition would wedge.
+            KafkaProduce::send(
+                $this->deadLetterProducer,
+                $topic . $this->dlqSuffix,
+                PoisonBody::annotate($raw['payload'], 'poison', null, $topic, $attempts),
+                $raw['headers'],
+                (int) round(microtime(true) * 1000),
+                $raw['key'] ?? null,
+            );
+        }
+
+        $this->commit();
     }
 
     /**

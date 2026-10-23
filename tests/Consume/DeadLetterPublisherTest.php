@@ -151,6 +151,18 @@ final class DeadLetterPublisherTest extends TestCase
         $this->assertSame('poison', $captured['dead_letter']['reason']);
     }
 
+    public function test_an_invalid_utf8_poison_body_is_dead_lettered_without_throwing(): void
+    {
+        $raw = "\xff\xfe{bad";
+        $message = new KafkaMessage(EnvelopeCodec::decode($raw, static function (): void {}), [], $raw);
+
+        $captured = $this->publishAndCapture($message);
+
+        $this->assertSame('base64', $captured['raw_encoding']);
+        $this->assertSame($raw, base64_decode($captured['raw'], true));
+        $this->assertSame('poison', $captured['dead_letter']['reason']);
+    }
+
     public function test_a_decodable_message_with_a_raw_body_dead_letters_its_envelope(): void
     {
         $raw = '{"job":"urn:babel:orders:created","trace_id":"trace-1","data":{"order_id":7},'

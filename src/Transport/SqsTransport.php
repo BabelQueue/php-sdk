@@ -6,6 +6,7 @@ namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\HeaderPublisher;
+use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Support\Headers;
 
 /**
@@ -38,6 +39,7 @@ use BabelQueue\Support\Headers;
  *     new class ($sqs) implements SqsClient {
  *         public function __construct(private \Aws\Sqs\SqsClient $c) {}
  *         public function sendMessage(array $args): mixed { return $this->c->sendMessage($args); }
+ *         public function changeMessageVisibility(array $args): mixed { return $this->c->changeMessageVisibility($args); }
  *     },
  *     'https://sqs.eu-central-1.amazonaws.com/123456789012/orders',
  * );
@@ -48,6 +50,12 @@ final class SqsTransport implements HeaderPublisher
     /** SQS allows at most 10 message attributes per message. */
     private const MAX_ATTRIBUTES = 10;
 
+    /** SQS caps a per-message `DelaySeconds` at 900 s (15 min), §3.4. */
+    public const MAX_DELAY_SECONDS = 900;
+
+    /** SQS caps a `VisibilityTimeout` at 12 h (43 200 s); {@see self::release()} clamps to it. */
+    public const MAX_VISIBILITY_TIMEOUT_SECONDS = 43200;
+
     public function __construct(
         private readonly SqsClient $client,
         private readonly string $queueUrl,
@@ -57,9 +65,35 @@ final class SqsTransport implements HeaderPublisher
     ) {
     }
 
-    public function publish(string $payload, ?string $queue = null): ?string
+    /**
+     * Publish the envelope. A `$delaySeconds` above 0 sends a per-message `DelaySeconds` (§3.4): at
+     * most {@see self::MAX_DELAY_SECONDS}, and not available on a FIFO queue (per-message delay is
+     * unsupported there) — both raise {@see BabelQueueException} before anything is sent; the delay
+     * is never silently dropped or truncated.
+     *
+     * @throws BabelQueueException  when the delay is above 900 s or the queue is FIFO
+     */
+    public function publish(string $payload, ?string $queue = null, ?int $delaySeconds = null): ?string
     {
-        return $this->send($payload, $queue, []);
+        return $this->send($payload, $queue, [], $delaySeconds);
+    }
+
+    /**
+     * Release a received message back to the queue after `$delaySeconds` (§3.5): a
+     * `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout)`. `0` makes it visible again now,
+     * `N` backs it off N seconds. SQS rejects a `VisibilityTimeout` above its 12 h maximum, so the
+     * delay is clamped to {@see self::MAX_VISIBILITY_TIMEOUT_SECONDS} (43 200 s; an unbounded
+     * `retry_backoff` therefore waits the maximum instead of failing the call) and a negative one to 0.
+     *
+     * @param  string|null  $queue  the queue URL the message was received from (default: this transport's)
+     */
+    public function release(string $receiptHandle, int $delaySeconds = 0, ?string $queue = null): void
+    {
+        $this->client->changeMessageVisibility([
+            'QueueUrl' => $queue ?? $this->queueUrl,
+            'ReceiptHandle' => $receiptHandle,
+            'VisibilityTimeout' => max(min($delaySeconds, self::MAX_VISIBILITY_TIMEOUT_SECONDS), 0),
+        ]);
     }
 
     /**
@@ -73,14 +107,23 @@ final class SqsTransport implements HeaderPublisher
      */
     public function publishWithHeaders(string $payload, array $headers, ?string $queue = null): ?string
     {
-        return $this->send($payload, $queue, $headers);
+        return $this->send($payload, $queue, $headers, null);
     }
 
     /**
      * @param  array<string, string>  $extraHeaders  out-of-band headers to carry beside the contract `bq-*`
      */
-    private function send(string $payload, ?string $queue, array $extraHeaders): ?string
+    private function send(string $payload, ?string $queue, array $extraHeaders, ?int $delaySeconds): ?string
     {
+        if ($delaySeconds !== null && $delaySeconds > 0) {
+            if ($this->fifo) {
+                throw new BabelQueueException('SQS FIFO queues do not support a per-message DelaySeconds (broker-bindings.md §3.4).');
+            }
+            if ($delaySeconds > self::MAX_DELAY_SECONDS) {
+                throw new BabelQueueException(sprintf('SQS DelaySeconds is capped at %d s (got %d); broker-bindings.md §3.4.', self::MAX_DELAY_SECONDS, $delaySeconds));
+            }
+        }
+
         $url = $queue ?? $this->queueUrl;
         // Decoded only to project the transport headers; the payload is published verbatim, so a
         // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
@@ -92,6 +135,10 @@ final class SqsTransport implements HeaderPublisher
             'MessageBody' => $payload,
             'MessageAttributes' => $this->attributes($envelope, $meta, $extraHeaders),
         ];
+
+        if ($delaySeconds !== null && $delaySeconds > 0) {
+            $args['DelaySeconds'] = $delaySeconds;
+        }
 
         if ($this->fifo) {
             $args['MessageGroupId'] = $this->messageGroupId ?? $this->queueName($url);

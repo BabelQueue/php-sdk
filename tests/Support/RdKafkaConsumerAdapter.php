@@ -57,6 +57,7 @@ final class RdKafkaConsumerAdapter implements KafkaConsumerClient, KafkaRedriveC
             'payload' => $record['payload'],
             'headers' => $record['headers'],
             'key' => $record['key'] ?? null,
+            'topic' => $record['topic'] ?? null,
         ];
     }
 

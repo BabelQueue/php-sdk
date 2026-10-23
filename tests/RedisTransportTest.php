@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Transport\RedisTransport;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
@@ -70,5 +71,34 @@ final class RedisTransportTest extends TestCase
             ->with(Mockery::type('string'), 2, 'queues:default', 'queues:default:notify', RedisTransport::frameValue('p', ['traceparent' => 'x']));
 
         (new RedisTransport($client, 'default', 'queues:'))->publishWithHeaders('p', ['traceparent' => 'x']);
+    }
+
+    public function test_publish_delayed_zadds_to_the_delayed_set_with_an_integer_score_and_no_notify_token(): void
+    {
+        $client = Mockery::mock(ClientInterface::class);
+        $client->shouldReceive('zadd')->once()->with('queues:orders:delayed', ['{"job":"x"}' => 1700000010]);
+        $client->shouldNotReceive('rpush');
+        $client->shouldNotReceive('eval');
+
+        $transport = new RedisTransport($client, 'default', RedisTransport::LARAVEL_KEY_PREFIX, static fn (): float => 1700000000.9);
+
+        $this->assertNull($transport->publishDelayed('{"job":"x"}', 9.2, 'orders'));
+    }
+
+    public function test_delayed_score_is_floor_now_plus_ceil_delay(): void
+    {
+        $this->assertSame(1700000011, RedisTransport::delayedScore(1700000000.999, 10.001));
+        $this->assertSame(1700000001, RedisTransport::delayedScore(1700000000.5, 0.1));
+        $this->assertSame(1700000000, RedisTransport::delayedScore(1700000000.5, 0));
+        $this->assertSame(1700000000, RedisTransport::delayedScore(1700000000.5, -3));
+    }
+
+    public function test_publish_delayed_needs_the_laravel_layout(): void
+    {
+        $client = Mockery::mock(ClientInterface::class);
+        $client->shouldNotReceive('zadd');
+
+        $this->expectException(BabelQueueException::class);
+        (new RedisTransport($client))->publishDelayed('x', 5);
     }
 }
