@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-10-24
+
 Implements ADR-0033 / ADR-0034 for the PHP core against conformance v1.6.0. The envelope stays at
 `schema_version: 1`; `conformance-known-gaps.json` is now empty.
 
