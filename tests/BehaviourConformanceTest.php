@@ -6,6 +6,7 @@ namespace BabelQueue\Tests;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
+use BabelQueue\DeadLetter\PoisonBody;
 use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Exceptions\InvalidEnvelopeException;
 use BabelQueue\Idempotency\Idempotent;
@@ -590,6 +591,50 @@ final class BehaviourConformanceTest extends TestCase
     {
         ConformanceResults::each('kafka_poison', static function (array $case): void {
             self::assertSame($case['expect'], KafkaBodyClassifier::classify((string) $case['body']), (string) $case['name']);
+        });
+    }
+
+    /**
+     * Poison DLQ record shape (ADR-0035, error-handling.md section 6): a strict JSON object is spliced
+     * byte-for-byte, anything else is wrapped as `{"raw", "raw_encoding"?, "dead_letter"}`; a body that
+     * is not valid UTF-8 is carried as standard base64 plus `raw_encoding: "base64"`.
+     */
+    public function test_poison_dlq_record_shape(): void
+    {
+        ConformanceResults::each('poison_dlq', static function (array $case): void {
+            $name = (string) $case['name'];
+            $body = isset($case['body_base64']) ? (string) base64_decode((string) $case['body_base64'], true) : (string) $case['body'];
+            $expect = $case['expect'];
+
+            $out = PoisonBody::annotate($body, 'poison', null, 'orders', 0);
+            self::assertTrue(preg_match('//u', $out) === 1, $name . ': the record is valid UTF-8 (no U+FFFD substitution)');
+            self::assertStringNotContainsString("\u{FFFD}", $out, $name);
+
+            $record = json_decode($out, true, 100000, JSON_THROW_ON_ERROR);
+            self::assertIsArray($record, $name);
+            self::assertSame('poison', $record['dead_letter']['reason'] ?? null, $name);
+            self::assertSame('orders', $record['dead_letter']['original_queue'] ?? null, $name);
+            $rest = $record;
+            unset($rest['dead_letter']);
+
+            if ($expect['shape'] === 'splice_or_wrapper' && ! array_key_exists('raw', $rest)) {
+                // Spliced instead of wrapped: every original literal survives and no member is added or lost.
+                foreach ((array) ($expect['splice_literals'] ?? []) as $literal) {
+                    self::assertStringContainsString((string) $literal, $out, $name . ': the literal is kept verbatim');
+                }
+                self::assertSame(
+                    array_map('strval', array_merge((array) ($expect['splice_keys'] ?? []), ['dead_letter'])),
+                    array_map('strval', array_keys($record)),
+                    $name . ': top-level members',
+                );
+
+                return;
+            }
+
+            self::assertEquals($expect['record'], $rest, $name);
+            if ($expect['shape'] === 'wrapper') {
+                self::assertSame('raw', array_key_first($record), $name);
+            }
         });
     }
 

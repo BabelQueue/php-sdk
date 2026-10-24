@@ -12,6 +12,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 Implements ADR-0033 / ADR-0034 for the PHP core against conformance v1.6.0. The envelope stays at
 `schema_version: 1`; `conformance-known-gaps.json` is now empty.
 
+### Changed
+- Poison DLQ record shape follows ADR-0035 (no code change: `PoisonBody` already splices strict objects byte-for-byte and wraps the rest, base64 + `raw_encoding` only for invalid UTF-8). `BehaviourConformanceTest` now runs the `poison_dlq` conformance section (43 cases).
+
 ### Fixed
 - **Kafka poison quarantine never throws (ADR-0034 section 10).** `KafkaConsumer` wrote the poison copy through
   `json_encode`, which threw on invalid UTF-8 or `1e400` and crash-looped the worker without committing. The copy is
