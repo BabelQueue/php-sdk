@@ -20,6 +20,12 @@ use RuntimeException;
  */
 final class RdKafkaConsumerAdapter implements KafkaConsumerClient, KafkaRedriveClient
 {
+    /**
+     * Kafka protocol error codes for a group coordinator that is not (yet) usable: COORDINATOR_LOAD_IN_PROGRESS (14),
+     * COORDINATOR_NOT_AVAILABLE (15), NOT_COORDINATOR (16). All retriable by definition.
+     */
+    private const RETRIABLE_COORDINATOR_ERRORS = [14, 15, 16];
+
     private readonly KafkaConsumer $consumer;
 
     private ?string $assignedTopic = null;
@@ -72,7 +78,24 @@ final class RdKafkaConsumerAdapter implements KafkaConsumerClient, KafkaRedriveC
     {
         $this->assign($topic);
 
-        $message = $this->consumer->consume($this->pollTimeoutMs);
+        // librdkafka surfaces group-coordinator hiccups as error events on consume(), not as exceptions. On a
+        // fresh broker the first lookup races the lazy creation of __consumer_offsets, so NOT_COORDINATOR /
+        // COORDINATOR_NOT_AVAILABLE / COORDINATOR_LOAD_IN_PROGRESS are transient and retried within the poll
+        // budget; only a persistent one (budget spent) is reported as an idle poll, never as a failure. The error
+        // can leave the partitions parked on the failed committed-offset lookup, so the assignment is re-applied
+        // (assign(null) + assign) to restart that lookup against the now-elected coordinator.
+        $deadline = microtime(true) + $this->pollTimeoutMs / 1000;
+        do {
+            $remainingMs = max(1, (int) (($deadline - microtime(true)) * 1000));
+            $message = $this->consumer->consume($remainingMs);
+            if (! in_array($message->err, self::RETRIABLE_COORDINATOR_ERRORS, true)) {
+                break;
+            }
+            usleep(100_000);
+            $this->consumer->assign(null);
+            $this->applyAssignment();
+        } while (microtime(true) < $deadline);
+
         switch ($message->err) {
             case RD_KAFKA_RESP_ERR_NO_ERROR:
                 break;
@@ -80,6 +103,9 @@ final class RdKafkaConsumerAdapter implements KafkaConsumerClient, KafkaRedriveC
             case RD_KAFKA_RESP_ERR__TIMED_OUT:
                 return null;
             default:
+                if (in_array($message->err, self::RETRIABLE_COORDINATOR_ERRORS, true)) {
+                    return null;
+                }
                 throw new RuntimeException('Kafka consume failed: ' . $message->errstr());
         }
 
