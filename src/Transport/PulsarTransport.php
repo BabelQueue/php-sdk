@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
-use BabelQueue\Contracts\Transport;
+use BabelQueue\Contracts\HeaderPublisher;
 
 /**
  * A framework-less **Apache Pulsar** producer — PHP's path to the §5 binding via Pulsar's native
@@ -33,7 +33,7 @@ use BabelQueue\Contracts\Transport;
  * {@see Transport} is publish-only, like the Redis/AMQP/SQS/STOMP/Kafka transports); PHP consumes
  * Pulsar via a framework worker.
  */
-final class PulsarTransport implements Transport
+final class PulsarTransport implements HeaderPublisher
 {
     public function __construct(
         private readonly PulsarWebSocketClient $client,
@@ -45,13 +45,23 @@ final class PulsarTransport implements Transport
 
     public function publish(string $payload, ?string $queue = null): ?string
     {
+        return $this->publishWithHeaders($payload, [], $queue);
+    }
+
+    /**
+     * Publish with extra message properties ({@see HeaderPublisher}): they are merged over the `bq-` projection, so a
+     * caller can carry the incoming route (`bq-job`) onto a copy (the dead-letter record). No headers is exactly
+     * {@see self::publish()}.
+     */
+    public function publishWithHeaders(string $payload, array $headers, ?string $queue = null): ?string
+    {
         $target = $queue ?? $this->defaultQueue;
         // Decoded only to project the transport headers; the payload is published verbatim, so a
         // silent sink keeps decode from logging a misleading "dropped" warning (K-15).
         $envelope = EnvelopeCodec::decode($payload, static function (): void {});
 
         $topic = sprintf('persistent://%s/%s/%s', $this->tenant, $this->namespace, $target);
-        $this->client->publish($topic, $payload, $this->properties($envelope));
+        $this->client->publish($topic, $payload, array_filter($headers, static fn (string $v, string $k): bool => $k !== '' && $v !== '', ARRAY_FILTER_USE_BOTH) + $this->properties($envelope));
 
         $meta = is_array($envelope['meta'] ?? null) ? $envelope['meta'] : [];
         $id = $meta['id'] ?? null;

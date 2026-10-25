@@ -332,6 +332,64 @@ else is rejected without decoding. A rejected record reaches the `Dispatcher` as
 `babelqueue:unsupported-schema-version:<value>` (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`), so it takes the
 unknown-URN path (never a handler) and its dead-letter copy keeps the original bytes.
 
+## Pulsar consumer: retry, queue name and subscription type
+
+`PulsarConsumer` + `Consume\Dispatcher` bound every message (`maxAttempts`, default 3; ADR-0036). A failing
+handler is retried by **re-publishing** the message to the same topic with `bq-attempts` + 1 and acknowledging the
+original, not by a negative acknowledgement: on an `Exclusive` / `Failover` subscription a nack does not advance
+Pulsar's redelivery count, so a nack-only retry would never reach the cap. A poison or version-gated body keeps its
+exact bytes and properties on the way.
+
+The consumer derives what it needs from your `PulsarWebSocketConsumerClient` adapter, and anything you pass
+explicitly wins; an adapter that implements the two interfaces below needs no configuration at all.
+
+| It needs | Derived from | Explicit |
+| :--- | :--- | :--- |
+| the retry producer | the client itself, when it also implements `PulsarWebSocketClient`; else a `PulsarWebSocketProducer` on the service URL the client reports (`PulsarServiceEndpoint::serviceUrl()`) | `retryProducer:`, or `serviceUrl:` |
+| the topic / queue (`<queue>.dlq`, the re-publish topic) | the client, when it implements `PulsarConsumerDescriptor` (`topic()`), else the `topic` key of the frame `receive()` returns (declare `topicFromFrame: true`). Give the **full** name (`persistent://tenant/ns/topic`): the retry copy goes to exactly that topic | `queue:` names the DLQ; a local name needs `tenant:` and `namespace:` to build the re-publish topic (never guessed) |
+| the subscription type | `PulsarConsumerDescriptor::subscriptionType()` | `subscriptionType:` |
+
+```php
+final class MyPulsarConsumerClient implements PulsarWebSocketConsumerClient, PulsarWebSocketClient, PulsarConsumerDescriptor
+{
+    // receive / acknowledge / negativeAcknowledge, publish(), then:
+    public function topic(): string { return 'persistent://public/default/orders'; }
+    public function subscriptionType(): ?string { return 'Exclusive'; }
+}
+
+$consumer = new PulsarConsumer(new MyPulsarConsumerClient());
+$consumer->consume((new Dispatcher(deadLetters: new DeadLetterPublisher($transport)))->on($urn, $handler));
+```
+
+**Fail-closed.** If no producer can be derived, the `PulsarConsumer` constructor throws a `BabelQueueException`
+unless the subscription is *known* to be `Shared` / `Key_Shared` (there a nack advances the redelivery count, so a
+nack-only retry works). An unknown subscription type counts as `Exclusive` (Pulsar's own default): this seam cannot ask
+the broker, so the consumer refuses to start rather than run a retry that may never end. To keep a nack-only consumer,
+declare it: `new PulsarConsumer($client, subscriptionType: 'Shared')` (or have the client implement
+`PulsarConsumerDescriptor`). Otherwise give it a producer (`retryProducer:`, `serviceUrl:`, or a client that also implements
+`PulsarWebSocketClient` / `PulsarServiceEndpoint`). A retry whose topic is still unknown throws as well, unless the subscription is known to be
+`Shared` / `Key_Shared`. Nothing is ever written to `default.dlq`: the DLQ is `<the consumer's queue>.dlq` (never picked from the
+envelope's `meta.queue`), and when the queue is unknown the `Dispatcher` treats a message that needs the DLQ as having
+no publisher (dropped and logged on Pulsar, rethrown on Kafka); a publisher that is set but cannot name the queue is dropped and logged on both. A `KafkaConsumerClient` reports the topic in the `topic` key of its `receive()` frame (else `KafkaConsumer`'s `$topic` argument, else the client's single `KafkaSubscriptionDescriptor` topic); `KafkaMessage::queue()` carries it. When it is unknown (a multi-topic subscription), a poison record is committed and dropped with a log line (section 6.5; the partition is never wedged) and so does the `Dispatcher` when it has a publisher (a rethrow would redeliver a record that can never be addressed); only with no publisher at all does it rethrow on Kafka.
+
+**Out of the box: `PulsarWebSocketSubscription`.** The SDK's own consumer client reads a subscription over
+`/ws/v2/consumer/...` and reports its topic, subscription type, service URL and token, so this is the whole setup, and
+the cap holds on `Exclusive` / `Failover` (the retry producer is built on the same service, from the consumer's real
+tenant / namespace / topic):
+
+```php
+$consumer = new PulsarConsumer(new PulsarWebSocketSubscription('http://pulsar:8080', 'persistent://acme/ns1/orders', 'my-sub'));
+```
+
+**Your own client that only reads.** A Pulsar WebSocket consumer connection cannot publish, but the producer endpoint is
+on the same service (`/ws/v2/producer/persistent/<tenant>/<namespace>/<topic>`). So when your client implements
+`PulsarServiceEndpoint` (`serviceUrl()`, `authToken()`), or you pass `serviceUrl:` (and `serviceAuthToken:` on an
+authenticated cluster), the consumer builds a `PulsarWebSocketProducer` there itself. `retryProducer:` and a client that is
+itself a `PulsarWebSocketClient` take precedence. Only a client that offers none of these (the SDK cannot know its service
+URL) still fails closed: pass `serviceUrl:`, `retryProducer:`, or declare `Shared` / `Key_Shared`. The producer also needs a
+topic to publish to: report a full one (`PulsarConsumerDescriptor::topic()`), pass `queue:` with `tenant:` and `namespace:`,
+or declare `topicFromFrame: true` when every frame carries the full `topic`.
+
 ## Design
 
 This core is the **contract runtime**, not a worker. It does not own a broker

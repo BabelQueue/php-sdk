@@ -63,6 +63,7 @@ final class DispatcherTest extends TestCase
         $calls = [];
         $boom = new RuntimeException('boom');
         $dispatcher = (new Dispatcher(
+            maxAttempts: 0, // no cap: attempts 2 would otherwise be exhausted (default 3) and dropped
             retryBackoff: new \BabelQueue\Consume\RetryBackoff(retryBackoff: 2, multiplier: 3),
             onRetry: function (ConsumedMessage $m, int $delay, \Throwable $e) use (&$calls): void {
                 $calls[] = [$m->attempts(), $delay, $e->getMessage()];
@@ -175,9 +176,15 @@ final class DispatcherTest extends TestCase
 
     public function test_unknown_urn_dead_letter_degrades_to_delete_without_a_publisher(): void
     {
-        // dead_letter strategy but no publisher → degrade to delete (no throw, nothing published).
-        (new Dispatcher('dead_letter'))($this->message('urn:babel:x'));
-        $this->addToAssertionCount(1);
+        // dead_letter strategy but no publisher → degrade to delete (no throw, nothing published), visibly:
+        // the drop is reported to the onDrop hook (ADR-0036 decision 3).
+        $dropped = [];
+        (new Dispatcher('dead_letter', onDrop: function (ConsumedMessage $m, string $why) use (&$dropped): void {
+            $dropped[] = $m->getUrn() . ' | ' . $why;
+        }))($this->message('urn:babel:x'));
+
+        $this->assertCount(1, $dropped);
+        $this->assertStringContainsString('urn:babel:x', $dropped[0]);
     }
 
     public function test_plugs_into_a_consumer_consume_loop_and_acks(): void
@@ -199,7 +206,7 @@ final class DispatcherTest extends TestCase
         });
 
         $calls = 0;
-        (new PulsarConsumer($client))->consume($dispatcher, function () use (&$calls): bool {
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume($dispatcher, function () use (&$calls): bool {
             return $calls++ >= 1;
         });
 

@@ -183,9 +183,10 @@ final class KafkaKeyPreservationTest extends TestCase
 
         $message = (new KafkaConsumer($client))->receive();
         $this->assertNotNull($message);
-        (new Dispatcher('dead_letter', 0, new DeadLetterPublisher(new KafkaTransport($producer))))($message);
+        // The gate-rejected envelope has no meta.queue: the queue is the caller's (the consumer's topic).
+        (new DeadLetterPublisher(new KafkaTransport($producer)))->publish($message, 'unknown_urn', null, null, 'orders');
 
-        $this->assertCarriesKey($producer->records, 'default.dlq', $key);
+        $this->assertCarriesKey($producer->records, 'orders.dlq', $key);
     }
 
     #[DataProvider('keys')]
@@ -195,9 +196,9 @@ final class KafkaKeyPreservationTest extends TestCase
         $raw = '{not json';
         $message = new KafkaMessage(EnvelopeCodec::decode($raw, static function (): void {}), [], $raw, null, $key);
 
-        (new DeadLetterPublisher(new KafkaTransport($producer)))->publish($message, 'poison', null);
+        (new DeadLetterPublisher(new KafkaTransport($producer)))->publish($message, 'poison', null, null, 'orders');
 
-        $this->assertCarriesKey($producer->records, 'default.dlq', $key);
+        $this->assertCarriesKey($producer->records, 'orders.dlq', $key);
     }
 
     public function test_a_producer_without_key_support_keeps_todays_behaviour(): void

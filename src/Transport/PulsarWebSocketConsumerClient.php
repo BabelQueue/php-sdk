@@ -24,7 +24,11 @@ interface PulsarWebSocketConsumerClient
      * Receive the next message from the subscription, or null if none arrived within the client's
      * read window (so the caller can poll without blocking forever).
      *
-     * @return array{messageId: string, payload: string, properties: array<string, string>, redeliveryCount: int}|null
+     * The optional `topic` is the topic this subscription reads (the full `persistent://...` name or its
+     * local name); {@see PulsarConsumer} uses it as the queue for `<queue>.dlq` when it was not given one
+     * explicitly (ADR-0036 decision 3). A message frame itself carries no topic, so the adapter adds it.
+     *
+     * @return array{messageId: string, payload: string, properties: array<string, string>, redeliveryCount: int, topic?: string|null}|null
      */
     public function receive(): ?array;
 

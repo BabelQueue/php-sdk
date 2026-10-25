@@ -9,6 +9,133 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0036 decisions 3, 4 and 8 for the PHP core against conformance v1.7.0 (new sections
+`identity_verdict` and `pulsar_exhaustion`). The envelope stays at `schema_version: 1`. This is a **MINOR**
+with behaviour changes, listed first.
+
+### Behaviour changes
+- **`Consume\Dispatcher` default `maxAttempts` is now `3` (was `0`, no cap).** The value is the total number of
+  deliveries a message gets, the first included; `0` is still accepted and means no cap. With a
+  `DeadLetterPublisher`, a handler that keeps throwing is now dead-lettered (`reason: "failed"`) at its third
+  delivery, and `on_unknown_urn: fail` / `release` of an unknown URN stop at the third delivery too (`reason:
+  "unknown_urn"`); before, both were redelivered without limit. A deployment that relied on no cap must pass
+  `maxAttempts: 0`.
+- **Pulsar: a `Dispatcher` without a `DeadLetterPublisher` now acknowledges, drops and logs a message whose
+  handler keeps failing at the cap** (it used to redeliver it forever). Only a `PulsarMessage` is dropped: for
+  Kafka and for any other `ConsumedMessage` implementation the exception is still rethrown. The drop is logged through the new
+  `$onDrop` constructor argument (`fn(ConsumedMessage $message, string $why): void`); the default is
+  `error_log`, never with the body.
+- **`on_unknown_urn: dead_letter` with no publisher now logs the drop** (unknown URN, and a poison body); it used
+  to ack silently.
+- **Kafka (`Dispatcher` over `KafkaConsumer`): the `Dispatcher` never drops.** At the cap without a publisher it
+  rethrows (the `KafkaRetryRouter` or the consumer decides); with a publisher it dead-letters to `<topic>.dlq`.
+  With the new default cap, a `Dispatcher` with a publisher dead-letters a Kafka record at its third delivery,
+  before a `KafkaRetryRouter` with its default `maxAttempts` of 5. Pass `maxAttempts: 0` (or no publisher) to the
+  `Dispatcher` to leave the cap to the router.
+- **Poison and identity-less bodies take their own route (ADR-0036 decisions 3 and 4).** A body that does not
+  decode, has a wrong-typed member, or has neither a valid `job` nor a valid `urn` (the `identity_verdict`
+  table, the same as `kafka_poison`) never reaches a handler and is no longer an "unknown URN": with a publisher
+  it is written to `<queue>.dlq` as the ADR-0035 record (`reason: "poison"`, no retry; before, a body with no
+  `meta.queue` went to `default.dlq`, and with `fail`/`release` it was redelivered without limit); `delete`
+  drops it; with no publisher `fail`/`release` take the bounded path above and `dead_letter` drops (Pulsar) or
+  rethrows (Kafka). A Pulsar body that carries `"data": []` (an empty JSON list instead of `{}`) is now poison,
+  as on Kafka.
+- **`dead_letter.attempts` is the counted value** for the records the `Dispatcher` writes on exhaustion
+  (`failed`, and the new `unknown_urn` cap): the reconciled attempts plus one for the current delivery, the value
+  compared with the cap (it used to be the delivered value, one lower). A direct dead-letter (`on_unknown_urn:
+  dead_letter`, poison) keeps the delivered value.
+
+- **The DLQ is `<consumer queue>.dlq`, never `default.dlq` (ADR-0036 decision 3).** The target comes from the
+  consumer's own queue / topic (`PulsarMessage::queue()`), not from the envelope's `meta.queue`: a producer may have
+  written any `meta.queue` (`EnvelopeCodec::make()` defaults it to `default`) onto a message that reached another
+  topic, and that name must not pick the DLQ. `dead_letter.original_queue` is the envelope's `meta.queue` when
+  present, else the consumer's queue. When the consumer's queue is unknown and a publisher IS set, the `Dispatcher`
+  applies the section 6.5 degrade on Pulsar and Kafka alike: acknowledge / commit, drop and log, no rethrow (a rethrow
+  would redeliver a record that can never be addressed and wedge the partition). With no publisher at all the earlier
+  rule stands (dropped and logged on Pulsar, rethrown on Kafka). Kafka follows the same rule:
+  `KafkaMessage` now implements `HasQueue` and carries the topic its `KafkaConsumerClient` reported (the optional
+  `topic` key of the `receive()` frame; `KafkaMessage::queue()` / the new 6th constructor argument). Behaviour
+  change for Kafka: over `KafkaConsumer` the DLQ used to be the envelope's `meta.queue` (so `meta.queue: "default"`
+  wrote `default.dlq`); it is now `<topic>.dlq`. The topic is the frame's `topic`, else `KafkaConsumer`'s `$topic`
+  argument, else the client's single subscribed topic (`KafkaSubscriptionDescriptor`); a multi-topic subscription with
+  no frame topic is ambiguous, and then the `Dispatcher` (with a publisher) commits, drops and logs the message instead of
+  rethrowing. A deployment that relied on `default.dlq` must pass `queue:` to `PulsarConsumer` / report the `topic`
+  from its `KafkaConsumerClient` (or use a client that reports its topic). Calling `DeadLetterPublisher::publish()` directly: a given `$queue` now wins over `meta.queue`, and a
+  message with neither throws a `BabelQueueException` instead of writing `default.dlq`.
+- **The Pulsar DLQ record keeps the incoming route.** `PulsarTransport` now implements `HeaderPublisher`
+  (`publishWithHeaders()`, headers merged over the `bq-` projection; no headers is exactly `publish()`), and the
+  `DeadLetterPublisher` carries the incoming message properties (`bq-job`, ... except `bq-attempts` and
+  `bq-schema-version`) of a `PulsarMessage` onto the record, so a redrive routes it where the original was routed.
+- **A failed dead-letter write is a nack, not a retry copy.** `DeadLetterPublisher::publish()` now throws
+  `Consume\DeadLetterWriteFailed` when the transport fails, and `PulsarConsumer::consume()` negatively acknowledges the
+  original (broker-bindings §5.5) instead of re-publishing it with `bq-attempts` + 1.
+- **Pulsar retry is a re-publish (ADR-0036 decision 1, the Go model).** A negative acknowledgement advances
+  Pulsar's redelivery count only on `Shared` / `Key_Shared`; on `Exclusive` / `Failover` it does not, so the cap
+  was never reached. `PulsarConsumer::consume()` (new `PulsarConsumer::retry()`) now re-publishes a failed message
+  to the same topic with `bq-attempts` + 1 (an envelope's top-level `attempts` kept in sync; a poison or
+  version-gated body keeps its exact bytes and properties) and acknowledges the original, whatever the
+  subscription type; a failed re-publish negatively acknowledges the original. The consumer **derives** the
+  producer and the topic itself (explicit `retryProducer:` / `queue:` win for what they name): the producer is
+  the client when it also implements `PulsarWebSocketClient`; the topic comes from the new optional
+  `PulsarConsumerDescriptor` (`topic()`, `subscriptionType()`) on the client, else from the frame's `topic` key.
+  The copy goes to the **full topic name the message was read from** (`PulsarMessage::topic()`); a local name is
+  completed only with an explicit `tenant:` and `namespace:` (never a guessed `public/default`), and otherwise the
+  retry throws (a nack on `Shared` / `Key_Shared`).
+  When no producer can be derived the retry would be a nack, which is correct on `Shared` / `Key_Shared` only, so
+  the `PulsarConsumer` constructor **fails closed** (below). See the README section "Pulsar consumer: retry, queue
+  name and subscription type".
+- **`new PulsarConsumer($client)` derives its retry producer, and fails closed only for a custom client that gives the SDK
+  nothing to derive it from.** A negative acknowledgement advances Pulsar's redelivery count only on
+  `Shared` / `Key_Shared`, and a `PulsarWebSocketConsumerClient` cannot ask the broker which type a subscription has, so an
+  unknown type is treated as `Exclusive` (Pulsar's default) and a nack-only retry would never reach `maxAttempts`. So
+  the producer is taken, in order, from: `retryProducer:`; the client itself when it also implements
+  `PulsarWebSocketClient`; or a `PulsarWebSocketProducer` on the Pulsar WebSocket service named by `serviceUrl:`
+  (token: `serviceAuthToken:`) or by the client's optional `PulsarServiceEndpoint` (`serviceUrl()`, `authToken()`); the
+  producer endpoint is the same host, `/ws/v2/producer/persistent/<tenant>/<namespace>/<topic>`, with tenant, namespace
+  and topic from the consumer's real full topic, never guessed. **The SDK's own client, the new
+  `PulsarWebSocketSubscription`, implements all of this: `new PulsarConsumer(new PulsarWebSocketSubscription($url,
+  $topic, $subscription))` needs no further argument and the cap holds on `Exclusive` / `Failover`.** Who is affected
+  (the constructor throws a `BabelQueueException` naming the way out): your own `PulsarWebSocketConsumerClient`
+  adapter that is none of the above, with no `retryProducer:`, no `serviceUrl:` and no declared `Shared` /
+  `Key_Shared` subscription; the SDK cannot know its service URL. The fix is one of: switch to
+  `PulsarWebSocketSubscription`; pass `serviceUrl:` (and `serviceAuthToken:` on an authenticated cluster) or let the
+  adapter implement `PulsarServiceEndpoint`; pass `retryProducer:`; or pass `subscriptionType: 'Shared'` (or
+  `'Key_Shared'`) if that is what the subscription is, which keeps the nack retry.
+- **A derived producer must know the topic it re-publishes to, at setup.** On an `Exclusive` / `Failover` / unknown
+  subscription the constructor now also throws when the retry topic cannot be known: the client reports no full topic
+  (`PulsarConsumerDescriptor::topic()`), and `$queue` + `$tenant` + `$namespace` were not all given. If your adapter puts the
+  FULL topic name in every frame's `topic` key, say so with `topicFromFrame: true`. (Before, the first failing handler
+  would throw out of `consume()` instead.) A known `Shared` / `Key_Shared` subscription never needs the topic.
+- A poison body that the lenient codec can still decode (for example a wrong-typed `trace_id`) no longer lends
+  its body `attempts` to the count: a poison body counts `bq-attempts` and the redelivery count only.
+
+### Added
+- `Consume\DeadLetterWriteFailed` is no longer `final`, so the Laravel adapter can extend it later.
+- `Transport\PulsarWebSocketSubscription`: the SDK's own Pulsar WebSocket consumer client (receive / acknowledge /
+  negative acknowledge over `/ws/v2/consumer/persistent/<tenant>/<namespace>/<topic>/<subscription>`, base64 payload
+  decoded, a read window that returns null when idle, reconnect on the next call after a broken connection). It
+  implements `PulsarConsumerDescriptor` and `PulsarServiceEndpoint`, so `new PulsarConsumer($subscription)` just works.
+- `Transport\KafkaSubscriptionDescriptor` (optional, on a `KafkaConsumerClient`: `subscribedTopics()`) and a trailing `$topic` argument
+  on `KafkaConsumer`: where the consumer's topic comes from when a record frame carries none (see "Behaviour changes").
+- `Transport\PulsarWebSocketProducer`: a dependency-free Pulsar WebSocket producer (RFC 6455 over `stream_socket_client`,
+  `ssl://` for `wss` / `https`, optional bearer token): one `publish()` opens the producer endpoint of the full topic,
+  sends one frame and waits for `{"result":"ok"}`; any other outcome throws. Optional `Transport\PulsarServiceEndpoint`
+  interface (`serviceUrl()`, `authToken()`) and a trailing `serviceUrl:` argument on `PulsarConsumer`; no existing
+  signature changed.
+- `PulsarConsumer` takes the queue it reads (`new PulsarConsumer($client, queue: 'orders')`, the topic's local
+  name), or the client adapter adds an optional `topic` key to the frame `receive()` returns, plus the optional
+  `retryProducer`, `tenant` (default null), `namespace` (default null) and `subscriptionType` arguments for the retry re-publish, and the optional
+  `PulsarConsumerDescriptor` interface a client adapter implements to report its topic and subscription type. The queue is exposed as
+  `PulsarMessage::queue()` (new `Contracts\HasQueue`; the message also exposes `properties()` through the new
+  `Contracts\HasMessageProperties`, and `topic()`).
+- `Codec\StrictBodyClassifier::isPoison()`, the binding-independent name for the strict body verdict
+  (`identity_verdict`); it delegates to `KafkaBodyClassifier`.
+- `DeadLetterPublisher::publish()` takes optional `$attempts` (the `dead_letter.attempts` value) and `$queue`
+  (used when the message has no `meta.queue`); `DeadLetterPublisher::resolveQueue()` says which queue a message
+  would use, or null when none can be named.
+- Conformance runners for `identity_verdict` (97 cases) and `pulsar_exhaustion` (29 cases); the vendored suite
+  and the workflow pins move to conformance v1.7.0.
+
 ## [1.25.0] - 2026-10-24
 
 Implements ADR-0033 / ADR-0034 for the PHP core against conformance v1.6.0. The envelope stays at
@@ -44,8 +171,10 @@ Implements ADR-0033 / ADR-0034 for the PHP core against conformance v1.6.0. The 
   is written to `<topic>.dlq` with `dead_letter.reason = poison` (original key and headers preserved) and then
   committed; without a producer it degrades to commit + drop (section 6.5). `receive()` returns `null` for such
   a record. A failing DLQ write does not commit and the exception propagates, so the record is redelivered.
-  `KafkaConsumerClient::receive()` may now return an optional `topic` (fallback: body `meta.queue`, then
-  `default`).
+  `KafkaConsumerClient::receive()` may now return an optional `topic`. (Superseded in this release: the
+  `meta.queue` / `default` fallback is gone, a poison record from a client that reports no topic makes
+  `KafkaConsumer` throw `BabelQueueException` and commit nothing, so the partition does not silently feed
+  `default.dlq`; see "The DLQ is `<consumer queue>.dlq`" above.)
 - `SqsTransport::MAX_VISIBILITY_TIMEOUT_SECONDS` (43 200).
 - `Consume\Dispatcher` takes an optional `$onRetry` closure `(ConsumedMessage, int $delaySeconds, Throwable)`,
   called when a handler throws and the message is not dead-lettered, so a transport release can apply the

@@ -72,13 +72,37 @@ final class DeadLetterPublisherTest extends TestCase
         $this->assertSame('php', $dl['lang']);
     }
 
-    public function test_falls_back_to_the_default_queue_when_meta_queue_is_missing(): void
+    public function test_uses_the_callers_queue_when_meta_queue_is_missing(): void
     {
         $transport = Mockery::mock(Transport::class);
-        $transport->shouldReceive('publish')->once()->with(Mockery::any(), 'default.dlq')->andReturn(null);
+        $transport->shouldReceive('publish')->once()->with(Mockery::any(), 'invoices.dlq')->andReturn(null);
 
-        (new DeadLetterPublisher($transport))->publish($this->message(['lang' => 'php']), 'unknown_urn', null);
+        (new DeadLetterPublisher($transport))->publish($this->message(['lang' => 'php']), 'unknown_urn', null, null, 'invoices');
         $this->addToAssertionCount(1);
+    }
+
+    public function test_never_writes_default_dlq_when_no_queue_can_be_named(): void
+    {
+        $transport = Mockery::mock(Transport::class);
+        $transport->shouldNotReceive('publish');
+        $publisher = new DeadLetterPublisher($transport);
+        $message = $this->message(['lang' => 'php']);
+
+        $this->assertNull($publisher->resolveQueue($message, 'unknown_urn'));
+        $this->assertNull($publisher->resolveQueue($message, 'unknown_urn', ''));
+
+        $this->expectException(\BabelQueue\Exceptions\BabelQueueException::class);
+        $publisher->publish($message, 'unknown_urn', null);
+    }
+
+    public function test_a_poison_copy_takes_the_callers_queue_not_the_bodys_meta_queue(): void
+    {
+        $raw = '{"job":"urn:babel:orders:created","trace_id":"t","data":[1],"meta":{"id":"m","queue":"orders","schema_version":1},"attempts":0}';
+        $message = new PulsarMessage(EnvelopeCodec::decode($raw, static function (): void {}), 'mid-1', $raw);
+        $publisher = new DeadLetterPublisher(Mockery::mock(Transport::class));
+
+        $this->assertSame('topic-queue', $publisher->resolveQueue($message, 'poison', 'topic-queue'));
+        $this->assertNull($publisher->resolveQueue($message, 'poison'), 'a poison copy has no queue of its own');
     }
 
     public function test_honours_a_custom_suffix(): void
@@ -92,7 +116,7 @@ final class DeadLetterPublisherTest extends TestCase
     }
 
     /** @return array<string, mixed>|null the decoded DLQ body published to $dlq */
-    private function publishAndCapture(ConsumedMessage $message, string $dlq = 'default.dlq'): ?array
+    private function publishAndCapture(ConsumedMessage $message, string $dlq = 'orders.dlq'): ?array
     {
         $captured = null;
         $transport = Mockery::mock(Transport::class);
@@ -106,7 +130,7 @@ final class DeadLetterPublisherTest extends TestCase
             $dlq,
         )->andReturn(null);
 
-        (new DeadLetterPublisher($transport))->publish($message, 'poison', null);
+        (new DeadLetterPublisher($transport))->publish($message, 'poison', null, null, 'orders');
 
         return $captured;
     }

@@ -7,6 +7,7 @@ namespace BabelQueue\Transport;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
 use BabelQueue\Contracts\HasHeaders;
+use BabelQueue\Contracts\HasQueue;
 use BabelQueue\Contracts\HasRawBody;
 use BabelQueue\Contracts\HasRecordKey;
 
@@ -28,7 +29,7 @@ use BabelQueue\Contracts\HasRecordKey;
  * URN is {@see KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the rejected value and the envelope
  * is only `['raw' => <body>, 'attempts' => n]`.
  */
-final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody, HasRecordKey
+final class KafkaMessage implements ConsumedMessage, HasHeaders, HasQueue, HasRawBody, HasRecordKey
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
@@ -36,6 +37,8 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody, Has
      * @param  string|null  $rawBody  the record value as received (kept for poison dead-lettering)
      * @param  string|null  $routedUrn  the URN to route on instead of the body's (the version-gate sentinel), or null
      * @param  string|null  $key  the record key bytes as received (null = null key; '' = a real, empty key)
+     * @param  string|null  $topic  the topic the record was read from (the consumer's own queue), when the client
+     *                              reported it; names `<topic>.dlq` for the {@see \BabelQueue\Consume\Dispatcher}
      */
     public function __construct(
         private readonly array $envelope,
@@ -43,6 +46,7 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody, Has
         private readonly ?string $rawBody = null,
         private readonly ?string $routedUrn = null,
         private readonly ?string $key = null,
+        private readonly ?string $topic = null,
     ) {
     }
 
@@ -121,6 +125,15 @@ final class KafkaMessage implements ConsumedMessage, HasHeaders, HasRawBody, Has
     public function recordKey(): ?string
     {
         return $this->key;
+    }
+
+    /**
+     * The topic this record was read from (a Kafka topic is the BabelQueue queue), or null when the consumer
+     * client did not report it. It, not the envelope's `meta.queue`, picks `<queue>.dlq` (ADR-0036 decision 3).
+     */
+    public function queue(): ?string
+    {
+        return $this->topic !== null && $this->topic !== '' ? $this->topic : null;
     }
 
     /**
