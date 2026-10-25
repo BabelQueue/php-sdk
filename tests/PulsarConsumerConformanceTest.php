@@ -26,7 +26,7 @@ final class PulsarConsumerConformanceTest extends TestCase
             $payload = (string) json_encode([
                 'job' => 'urn:babel:orders:created',
                 'trace_id' => 'trace-1',
-                'data' => [],
+                'data' => new \stdClass(), // canonical `{}`: a list `[]` is a wrong-typed member, i.e. poison
                 'meta' => ['id' => 'm', 'queue' => 'orders', 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
                 'attempts' => $case['body_attempts'],
             ]);
@@ -39,7 +39,7 @@ final class PulsarConsumerConformanceTest extends TestCase
                 'redeliveryCount' => $case['redelivery_count'],
             ]);
 
-            $message = (new PulsarConsumer($client))->receive();
+            $message = (new PulsarConsumer($client, subscriptionType: 'Shared'))->receive();
 
             $this->assertNotNull($message, $case['name']);
             $this->assertSame($case['expected_attempts'], $message->attempts(), $case['name']);
@@ -70,7 +70,7 @@ final class PulsarConsumerConformanceTest extends TestCase
                 'redeliveryCount' => 0,
             ]);
 
-            $message = (new PulsarConsumer($client))->receive();
+            $message = (new PulsarConsumer($client, subscriptionType: 'Shared'))->receive();
 
             $this->assertNotNull($message, $label);
             if ($case['expect'] === 'decode') {

@@ -6,6 +6,8 @@ namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\ConsumedMessage;
+use BabelQueue\Contracts\HasMessageProperties;
+use BabelQueue\Contracts\HasQueue;
 use BabelQueue\Contracts\HasRawBody;
 
 /**
@@ -18,18 +20,25 @@ use BabelQueue\Contracts\HasRawBody;
  * is never decoded: the routing URN is {@see PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the
  * rejected value and the envelope is only `['raw' => <body>, 'attempts' => n]`.
  */
-final class PulsarMessage implements ConsumedMessage, HasRawBody
+final class PulsarMessage implements ConsumedMessage, HasMessageProperties, HasQueue, HasRawBody
 {
     /**
      * @param  array<string, mixed>  $envelope  the decoded envelope, with `attempts` already reconciled
      * @param  string|null  $rawBody  the body bytes as received (kept for poison dead-lettering)
      * @param  string|null  $routedUrn  the `bq-job` property URN to route on, or null to use the body's
+     * @param  string|null  $queue  the consumer's queue (its topic's local name), or null when unknown; names `<queue>.dlq`
+     * @param  array<string, string>  $properties  the message properties as received (kept so a retry re-publish carries them)
+     * @param  string|null  $topic  the full topic name (`persistent://tenant/namespace/topic`) the consumer reads, when
+     *                              known; the retry re-publishes to exactly this topic
      */
     public function __construct(
         private readonly array $envelope,
         private readonly string $messageId,
         private readonly ?string $rawBody = null,
         private readonly ?string $routedUrn = null,
+        private readonly ?string $queue = null,
+        private readonly array $properties = [],
+        private readonly ?string $topic = null,
     ) {
     }
 
@@ -87,6 +96,32 @@ final class PulsarMessage implements ConsumedMessage, HasRawBody
     public function envelope(): array
     {
         return $this->envelope;
+    }
+
+    /**
+     * The consumer's queue (the topic's local name), or null when the consumer was not told its topic.
+     */
+    public function queue(): ?string
+    {
+        return $this->queue;
+    }
+
+    /**
+     * The full topic name this message was read from, when the consumer knows it, else null.
+     */
+    public function topic(): ?string
+    {
+        return $this->topic;
+    }
+
+    /**
+     * The message properties as received (`bq-job`, `bq-attempts`, ...), string to string.
+     *
+     * @return array<string, string>
+     */
+    public function properties(): array
+    {
+        return $this->properties;
     }
 
     /**

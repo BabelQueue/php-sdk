@@ -41,19 +41,19 @@ final class PulsarConsumerTest extends TestCase
         return (string) json_encode([
             'job' => $job,
             'trace_id' => 'trace-1',
-            'data' => [],
+            'data' => new \stdClass(), // canonical `{}`: a list `[]` is a wrong-typed member, i.e. poison
             'meta' => ['id' => 'm', 'queue' => 'orders', 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
             'attempts' => $attempts,
         ]);
     }
 
     /** @param array<string, string> $properties */
-    private function receiveWith(string $payload, array $properties, int $redelivery = 0, ?callable $hook = null): ?PulsarMessage
+    private function receiveWith(string $payload, array $properties, int $redelivery = 0, ?callable $hook = null, ?string $queue = null): ?PulsarMessage
     {
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturn($this->raw($payload, $redelivery, $properties));
 
-        return (new PulsarConsumer($client, $hook))->receive();
+        return (new PulsarConsumer($client, $hook, $queue, subscriptionType: 'Shared'))->receive();
     }
 
     public function test_receive_decodes_the_envelope_and_exposes_the_inbound_view(): void
@@ -61,7 +61,7 @@ final class PulsarConsumerTest extends TestCase
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturn($this->raw());
 
-        $message = (new PulsarConsumer($client))->receive();
+        $message = (new PulsarConsumer($client, subscriptionType: 'Shared'))->receive();
 
         $this->assertInstanceOf(PulsarMessage::class, $message);
         $this->assertSame('urn:babel:orders:created', $message->getUrn());
@@ -78,7 +78,7 @@ final class PulsarConsumerTest extends TestCase
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturn($this->raw(redelivery: 3));
 
-        $message = (new PulsarConsumer($client))->receive();
+        $message = (new PulsarConsumer($client, subscriptionType: 'Shared'))->receive();
 
         $this->assertSame(3, $message->attempts()); // max(body 0, redelivery 3)
     }
@@ -88,7 +88,7 @@ final class PulsarConsumerTest extends TestCase
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturnNull();
 
-        $this->assertNull((new PulsarConsumer($client))->receive());
+        $this->assertNull((new PulsarConsumer($client, subscriptionType: 'Shared'))->receive());
     }
 
     public function test_consume_acknowledges_after_a_successful_handler(): void
@@ -99,7 +99,7 @@ final class PulsarConsumerTest extends TestCase
 
         $handled = null;
         $calls = 0;
-        (new PulsarConsumer($client))->consume(
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume(
             function (PulsarMessage $m) use (&$handled): void {
                 $handled = $m->getUrn();
             },
@@ -119,7 +119,7 @@ final class PulsarConsumerTest extends TestCase
         $client->shouldNotReceive('acknowledge');
 
         $calls = 0;
-        (new PulsarConsumer($client))->consume(
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume(
             function (PulsarMessage $m): void {
                 throw new RuntimeException('boom');
             },
@@ -139,7 +139,7 @@ final class PulsarConsumerTest extends TestCase
 
         $handlerCalls = 0;
         $calls = 0;
-        (new PulsarConsumer($client))->consume(
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume(
             function (PulsarMessage $m) use (&$handlerCalls): void {
                 $handlerCalls++;
             },
@@ -156,7 +156,7 @@ final class PulsarConsumerTest extends TestCase
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturn($this->raw());
 
-        $this->assertSame(self::ENVELOPE, (new PulsarConsumer($client))->receive()->rawBody());
+        $this->assertSame(self::ENVELOPE, (new PulsarConsumer($client, subscriptionType: 'Shared'))->receive()->rawBody());
     }
 
     public function test_bq_job_property_routes_even_when_the_body_names_a_different_urn(): void
@@ -189,7 +189,7 @@ final class PulsarConsumerTest extends TestCase
             });
 
         $calls = 0;
-        (new PulsarConsumer($client))->consume($dispatcher, function () use (&$calls): bool {
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume($dispatcher, function () use (&$calls): bool {
             return $calls++ >= 1;
         });
 
@@ -233,7 +233,7 @@ final class PulsarConsumerTest extends TestCase
             $handled++;
         });
         $calls = 0;
-        (new PulsarConsumer($client))->consume($dispatcher, function () use (&$calls): bool {
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume($dispatcher, function () use (&$calls): bool {
             return $calls++ >= 1;
         });
 
@@ -298,7 +298,7 @@ final class PulsarConsumerTest extends TestCase
         $handled = null;
         $consumer = new PulsarConsumer($client, function (): void {
             throw new RuntimeException('hook failure');
-        });
+        }, subscriptionType: 'Shared');
         $calls = 0;
         $consumer->consume(
             function (PulsarMessage $m) use (&$handled): void {
@@ -467,7 +467,7 @@ final class PulsarConsumerTest extends TestCase
         });
 
         $calls = 0;
-        (new PulsarConsumer($client))->consume(function (PulsarMessage $m) use ($dispatcher): void {
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume(function (PulsarMessage $m) use ($dispatcher): void {
             try {
                 $dispatcher($m);
             } catch (UnknownUrnException $e) {
@@ -485,7 +485,7 @@ final class PulsarConsumerTest extends TestCase
     public function test_a_gated_message_is_dead_lettered_with_its_original_bytes(): void
     {
         $body = $this->envelopeWith('urn:babel:orders:created');
-        $message = $this->receiveWith($body, ['bq-schema-version' => 'x']);
+        $message = $this->receiveWith($body, ['bq-schema-version' => 'x'], 0, null, 'orders');
 
         $published = [];
         $transport = Mockery::mock(Transport::class);
@@ -500,8 +500,7 @@ final class PulsarConsumerTest extends TestCase
         // The sentinel URN is an in-process marker: the dead-letter record never carries it.
         $this->assertStringNotContainsString('"job":"babelqueue:unsupported-schema-version', $published[2]);
         $this->assertArrayNotHasKey('job', $published[0]);
-        // The gate does not decode the body, so `meta.queue` is unknown and the record goes to the
-        // default dead-letter queue rather than `<queue>.dlq` (documented in the CHANGELOG).
-        $this->assertSame('default.dlq', $published[1]);
+        // The gate does not decode the body, so `meta.queue` is unknown: the queue is the consumer's.
+        $this->assertSame('orders.dlq', $published[1]);
     }
 }

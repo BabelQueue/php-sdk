@@ -26,9 +26,12 @@ interface KafkaConsumerClient
      * empty string is a real, empty key) — carried through the retry / dead-letter writes
      * ({@see KeyedKafkaProducer}).
      *
-     * The optional `topic` is the topic the record was read from (omit it, or null, when unknown); a
-     * poison record is dead-lettered to `<topic>.dlq`, falling back to the body's `meta.queue`
-     * (default `default`) when it is absent.
+     * The `topic` is the topic the record was read from. Report it: it is the consumer's queue, and it alone
+     * names `<topic>.dlq` for both the {@see \BabelQueue\Consume\Dispatcher} and a poison record
+     * (ADR-0036 decision 3). Without it the consumer falls back to its `$topic` argument, then to a single-topic
+     * {@see KafkaSubscriptionDescriptor}. If none names it, the body's `meta.queue` is still never used and
+     * `default.dlq` is never written: a poison record is committed and dropped with a log line (section 6.5), and the
+     * Dispatcher rethrows for a message that needs the DLQ.
      *
      * @return array{payload: string, headers: array<string, string>, key?: string|null, topic?: string|null}|null
      */

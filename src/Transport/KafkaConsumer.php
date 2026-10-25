@@ -50,6 +50,11 @@ use Throwable;
  * opt-in: with no `$deadLetterProducer` the record degrades to commit-and-drop (§6.5), so it is never
  * redelivered in a loop. If the DLQ write itself throws, the offset is **not** committed and the
  * exception propagates (a later commit would otherwise silently skip the record).
+ *
+ * **The DLQ topic is the consumer's own topic** (ADR-0036 decision 3), never the body's `meta.queue` and never
+ * `default.dlq`: the frame's `topic`, else the `$topic` argument, else the client's single subscribed topic
+ * ({@see KafkaSubscriptionDescriptor}). When none of them names it (a multi-topic subscription is ambiguous), the
+ * record is committed and dropped with an `error_log` line (section 6.5), so a partition is never wedged.
  */
 final class KafkaConsumer
 {
@@ -64,11 +69,14 @@ final class KafkaConsumer
      *                                                  (a {@see KeyedKafkaProducer} also carries the record key);
      *                                                  null = commit-and-drop (§6.5, DLQ is opt-in)
      * @param  string  $dlqSuffix  the dead-letter-topic suffix (`<topic>.dlq`)
+     * @param  string|null  $topic  the topic this consumer reads, used when a record frame carries no `topic`; null = ask
+     *                              the client ({@see KafkaSubscriptionDescriptor}, single-topic subscriptions only)
      */
     public function __construct(
         private readonly KafkaConsumerClient $client,
         private readonly ?KafkaProducer $deadLetterProducer = null,
         private readonly string $dlqSuffix = '.dlq',
+        private readonly ?string $topic = null,
     ) {
     }
 
@@ -100,6 +108,7 @@ final class KafkaConsumer
                 $raw['payload'],
                 self::UNSUPPORTED_SCHEMA_URN_PREFIX . $rejectedVersion,
                 $raw['key'] ?? null,
+                $this->sourceTopic($raw),
             );
         }
 
@@ -121,7 +130,32 @@ final class KafkaConsumer
 
         // Carry the raw bq- headers so the §6.4/§6.5 retry-topic machinery can recover a retry
         // record's original work topic (bq-original-topic) across hops.
-        return new KafkaMessage($envelope, $raw['headers'], $raw['payload'], null, $raw['key'] ?? null);
+        return new KafkaMessage($envelope, $raw['headers'], $raw['payload'], null, $raw['key'] ?? null, $this->sourceTopic($raw));
+    }
+
+    /**
+     * The topic a record was read from: the frame's `topic`, else the configured `$topic`, else the client's single
+     * subscribed topic. Null when none of them says (a multi-topic subscription is ambiguous).
+     *
+     * @param  array{payload: string, headers: array<string, string>, key?: string|null, topic?: string|null}  $raw
+     */
+    private function sourceTopic(array $raw): ?string
+    {
+        $topic = $raw['topic'] ?? null;
+        if (is_string($topic) && $topic !== '') {
+            return $topic;
+        }
+        if ($this->topic !== null && $this->topic !== '') {
+            return $this->topic;
+        }
+        if ($this->client instanceof KafkaSubscriptionDescriptor) {
+            $topics = array_values(array_filter($this->client->subscribedTopics(), static fn (string $t): bool => $t !== ''));
+            if (count($topics) === 1) {
+                return $topics[0];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -133,9 +167,15 @@ final class KafkaConsumer
     private function quarantine(array $raw): void
     {
         if ($this->deadLetterProducer !== null) {
-            $topic = $raw['topic'] ?? null;
-            if (! is_string($topic) || $topic === '') {
-                $topic = PoisonBody::queueHint($raw['payload']) ?? 'default';
+            $topic = $this->sourceTopic($raw);
+            if ($topic === null) {
+                // ADR-0036 decision 3: the DLQ is `<consumer queue>.dlq`, never the body's `meta.queue`, never
+                // `default.dlq`. With no queue to name it this is the "no publisher" case of section 6.5: commit and
+                // drop, loudly. Throwing instead would leave the offset uncommitted and wedge the partition.
+                error_log('[babelqueue] A poison Kafka record was dropped: the topic it was read from is unknown (no "topic" in the receive() frame, no $topic, no single-topic KafkaSubscriptionDescriptor), so no <topic>' . $this->dlqSuffix . ' can be named.');
+                $this->commit();
+
+                return;
             }
 
             $headerAttempts = $raw['headers']['bq-attempts'] ?? null;

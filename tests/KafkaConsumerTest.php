@@ -12,6 +12,7 @@ use BabelQueue\Transport\KafkaConsumer;
 use BabelQueue\Transport\KafkaConsumerClient;
 use BabelQueue\Transport\KafkaMessage;
 use BabelQueue\Transport\KafkaProducer;
+use BabelQueue\Transport\KafkaSubscriptionDescriptor;
 use BabelQueue\Transport\KeyedKafkaProducer;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
@@ -35,11 +36,11 @@ final class KafkaConsumerTest extends TestCase
 
     /**
      * @param  array<string, string>  $headers
-     * @return array{payload: string, headers: array<string, string>}
+     * @return array{payload: string, headers: array<string, string>, topic?: string}
      */
-    private function raw(array $headers = [], string $payload = self::ENVELOPE): array
+    private function raw(array $headers = [], string $payload = self::ENVELOPE, ?string $topic = 'orders'): array
     {
-        return ['payload' => $payload, 'headers' => $headers];
+        return ['payload' => $payload, 'headers' => $headers] + ($topic === null ? [] : ['topic' => $topic]);
     }
 
     public function test_receive_decodes_the_envelope_and_exposes_the_inbound_view(): void
@@ -274,16 +275,26 @@ final class KafkaConsumerTest extends TestCase
             $published = [json_decode($payload, true), $queue, $payload];
         });
 
+        // The consumer's topic names the DLQ (`meta.queue` is unknown here, the gate never decodes the body).
         (new Dispatcher('dead_letter', 0, new DeadLetterPublisher($transport)))($message);
+
+        // Without a topic (and no Kafka-side way to derive one) a publisher cannot name `<queue>.dlq`: nothing is written to
+        // `default.dlq`, and the record is dropped and logged (ADR-0036 decision 3), not rethrown.
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw(['bq-schema-version' => 'x'], self::ENVELOPE, null));
+        $topicless = (new KafkaConsumer($client))->receive();
+        $dropped = 0;
+        (new Dispatcher('dead_letter', 0, new DeadLetterPublisher(Mockery::mock(Transport::class)), onDrop: static function () use (&$dropped): void {
+            $dropped++;
+        }))($topicless);
+        $this->assertSame(1, $dropped);
 
         $this->assertSame(self::ENVELOPE, $published[0]['raw']);
         $this->assertSame('unknown_urn', $published[0]['dead_letter']['reason']);
         // The sentinel URN is an in-process marker: the dead-letter record never carries it.
         $this->assertStringNotContainsString('"job":"babelqueue:unsupported-schema-version', $published[2]);
         $this->assertArrayNotHasKey('job', $published[0]);
-        // The gate does not decode the body, so `meta.queue` is unknown and the record goes to the
-        // default dead-letter queue rather than `<queue>.dlq`.
-        $this->assertSame('default.dlq', $published[1]);
+        $this->assertSame('orders.dlq', $published[1]);
     }
     // -- poison / no_identity -> <topic>.dlq with reason poison (ADR-0034 §10) ----------
 
@@ -433,7 +444,7 @@ final class KafkaConsumerTest extends TestCase
 
         $this->assertSame(['produce', 'commit'], $log, 'written to the DLQ and committed: the partition must not wedge');
         $payload = $recorder->records[0]['payload'];
-        $this->assertSame('default.dlq', $recorder->records[0]['topic']);
+        $this->assertSame('orders.dlq', $recorder->records[0]['topic']);
 
         $dlq = json_decode($payload, true);
         $this->assertIsArray($dlq, 'the DLQ record is valid JSON');
@@ -465,24 +476,102 @@ final class KafkaConsumerTest extends TestCase
         $this->assertSame('poison', json_decode($payload, false)->dead_letter->reason);
     }
 
-    public function test_the_dlq_topic_falls_back_to_the_body_queue_then_default_without_a_client_topic(): void
+    public function test_the_dlq_topic_is_the_clients_topic_never_the_body_queue(): void
     {
         $log = [];
         [$producer, $recorder] = $this->recordingProducer($log);
         $client = Mockery::mock(KafkaConsumerClient::class);
-        $client->shouldReceive('receive')->twice()->andReturn(
-            $this->raw([], '{"meta":{"queue":"billing"}}'),
-            $this->raw([], '{}'),
+        $client->shouldReceive('receive')->once()->andReturn(
+            $this->raw([], '{"meta":{"queue":"billing"}}', 'shipping'),
         );
-        $client->shouldReceive('commit')->twice();
+        $client->shouldReceive('commit')->once();
 
-        $consumer = new KafkaConsumer($client, $producer);
-        $consumer->receive();
-        $consumer->receive();
+        (new KafkaConsumer($client, $producer))->receive();
 
-        $this->assertSame('billing.dlq', $recorder->records[0]['topic']);
-        $this->assertSame('default.dlq', $recorder->records[1]['topic']);
-        $this->assertNull($recorder->records[1]['key']);
+        $this->assertSame(['shipping.dlq'], array_column($recorder->records, 'topic'));
+    }
+
+    /**
+     * @param  list<string>|null  $subscribed  null = a client that is not a {@see KafkaSubscriptionDescriptor}
+     * @return array{0: KafkaConsumerClient, 1: object, 2: object}  client, recorder, producer
+     */
+    private function poisonSetup(?array $subscribed, ?string $frameTopic): array
+    {
+        $log = [];
+        [$producer, $recorder] = $this->recordingProducer($log);
+        $frame = $this->raw([], '{"meta":{"queue":"billing"}}', $frameTopic);
+        $client = $subscribed === null
+            ? Mockery::mock(KafkaConsumerClient::class)
+            : Mockery::mock(KafkaConsumerClient::class, KafkaSubscriptionDescriptor::class);
+        $client->shouldReceive('receive')->once()->andReturn($frame);
+        $client->shouldReceive('commit')->once(); // always committed: never a wedged partition
+        if ($subscribed !== null) {
+            $client->shouldReceive('subscribedTopics')->andReturn($subscribed);
+        }
+
+        return [$client, $recorder, $producer];
+    }
+
+    public function test_a_poison_record_without_any_topic_is_committed_dropped_and_logged_never_a_default_dlq(): void
+    {
+        foreach ([[null, null], [null, ''], [['a', 'b'], null], [[], null]] as [$subscribed, $frameTopic]) {
+            [$client, $recorder, $producer] = $this->poisonSetup($subscribed, $frameTopic);
+            $logged = '';
+            $previous = ini_set('error_log', $file = tempnam(sys_get_temp_dir(), 'bqlog'));
+
+            try {
+                $this->assertNull((new KafkaConsumer($client, $producer))->receive(), 'no throw: the partition must not wedge');
+                $logged = (string) file_get_contents($file);
+            } finally {
+                ini_set('error_log', (string) $previous);
+                unlink($file);
+            }
+
+            $this->assertSame([], $recorder->records, 'neither billing.dlq (meta.queue) nor default.dlq');
+            $this->assertStringContainsString('poison Kafka record was dropped', $logged);
+        }
+    }
+
+    public function test_the_dlq_topic_falls_back_to_the_constructor_topic_then_a_single_subscribed_topic(): void
+    {
+        // the constructor's topic
+        [$client, $recorder, $producer] = $this->poisonSetup(null, null);
+        (new KafkaConsumer($client, $producer, '.dlq', 'shipping'))->receive();
+        $this->assertSame(['shipping.dlq'], array_column($recorder->records, 'topic'));
+
+        // a single subscribed topic of the client
+        [$client, $recorder, $producer] = $this->poisonSetup(['invoices'], null);
+        (new KafkaConsumer($client, $producer))->receive();
+        $this->assertSame(['invoices.dlq'], array_column($recorder->records, 'topic'));
+
+        // the frame wins over both
+        [$client, $recorder, $producer] = $this->poisonSetup(['invoices'], 'orders');
+        (new KafkaConsumer($client, $producer, '.dlq', 'shipping'))->receive();
+        $this->assertSame(['orders.dlq'], array_column($recorder->records, 'topic'));
+    }
+
+    public function test_the_message_queue_follows_the_same_derivation(): void
+    {
+        $client = Mockery::mock(KafkaConsumerClient::class, KafkaSubscriptionDescriptor::class);
+        $client->shouldReceive('receive')->twice()->andReturn($this->raw([], self::ENVELOPE, null), $this->raw([], self::ENVELOPE, null));
+        $client->shouldReceive('subscribedTopics')->andReturn(['orders', 'billing'], ['orders']);
+        $consumer = new KafkaConsumer($client);
+
+        $this->assertNull($consumer->receive()?->queue(), 'two subscribed topics: ambiguous');
+        $this->assertSame('orders', $consumer->receive()?->queue());
+    }
+
+    public function test_receive_carries_the_source_topic_as_the_queue(): void
+    {
+        $client = Mockery::mock(KafkaConsumerClient::class);
+        $client->shouldReceive('receive')->twice()->andReturn(
+            $this->raw([], self::ENVELOPE, 'shipping'),
+            $this->raw([], self::ENVELOPE, null),
+        );
+        $consumer = new KafkaConsumer($client);
+
+        $this->assertSame('shipping', $consumer->receive()?->queue());
+        $this->assertNull($consumer->receive()?->queue());
     }
 
     public function test_an_unusable_body_without_a_dlq_producer_is_committed_and_dropped(): void
