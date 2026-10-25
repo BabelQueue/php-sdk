@@ -49,10 +49,13 @@ use Throwable;
  * read. A missing or blank value (empty or only ASCII whitespace) changes nothing; any value other than
  * {@see EnvelopeCodec::SCHEMA_VERSION} (`"2"`, `"x"`, `"01"`, ...; exact string match) leaves the body
  * undecoded and yields a message whose routing URN is the reserved
- * {@see self::UNSUPPORTED_SCHEMA_URN_PREFIX}`<value>`. No handler owns it, so the Dispatcher takes
- * its existing unknown-URN path (`on_unknown_urn`: release / dead-letter / ...), and the error names
- * the rejected version. The envelope of such a message is only `['raw' => <body>, 'attempts' => n]`,
- * so a dead-letter copy keeps the producer's bytes in the same `{"raw": ...}` shape as a poison body.
+ * {@see self::UNSUPPORTED_SCHEMA_URN_PREFIX}`<value>`. No handler owns it, and it is neither an unknown URN nor
+ * poison: the {@see \BabelQueue\Consume\Dispatcher} settles it on its **first** delivery (ADR-0037 decision 1) without
+ * decoding it, calling a handler or retrying it, whatever `bq-attempts`, the redelivery count or its `maxAttempts`
+ * say: ack (`delete`, or no dead-letter publisher: dropped and logged), or the raw body byte for byte to
+ * `<queue>.dlq` and then ack; a failed write is a {@see DeadLetterWriteFailed}, which {@see self::consume()}
+ * negatively acknowledges (never re-published as a retry). The envelope of such a message is only
+ * `['raw' => <body>, 'attempts' => n]`; the body is available as {@see PulsarMessage::rawBody()}.
  *
  * **Queue name (ADR-0036 decision 3).** A Pulsar message frame carries no topic, so the consumer is told
  * the queue it reads: pass `$queue` (the topic's local name, e.g. `orders` for

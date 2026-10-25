@@ -468,14 +468,95 @@ final class DispatcherTerminationTest extends TestCase
         $this->assertSame([], $this->published);
     }
 
-    public function test_a_version_gated_pulsar_delivery_is_dead_lettered_to_the_consumers_queue(): void
+    // -- version gate (ADR-0037 decision 1, Pulsar §5.7) ---------------------------------------------------
+
+    /** @return array<string, string> */
+    private function gated(string $attempts = '0'): array
+    {
+        return ['bq-schema-version' => '2', 'bq-attempts' => $attempts];
+    }
+
+    public function test_a_version_gated_pulsar_delivery_is_written_raw_to_the_consumers_queue_dlq(): void
     {
         $dispatcher = new Dispatcher('dead_letter', 3, $this->publisher());
 
-        $dispatcher($this->pulsar(self::BODY, 0, ['bq-schema-version' => '2']));
+        $dispatcher($this->pulsar(self::BODY, 0, $this->gated()));
 
+        $this->assertCount(1, $this->published);
         $this->assertSame('orders.dlq', $this->published[0][1]);
-        $this->assertSame('unknown_urn', $this->record()['dead_letter']['reason']);
+        // The raw record: the exact bytes, no `dead_letter` block, no ADR-0035 wrapping.
+        $this->assertSame(self::BODY, $this->published[0][0]);
+    }
+
+    public function test_a_version_gated_delivery_is_settled_on_the_first_delivery_whatever_the_attempts_say(): void
+    {
+        foreach (['fail', 'release', 'dead_letter'] as $strategy) {
+            $this->published = [];
+            $dispatcher = (new Dispatcher($strategy, 3, $this->publisher()))
+                ->on(self::URN, static fn () => self::fail('a version-gated delivery must never reach a handler'));
+
+            // Well below the cap, and far above it: the outcome does not depend on the attempts.
+            $dispatcher($this->pulsar(self::BODY, 0, $this->gated('0')));
+            $dispatcher($this->pulsar(self::BODY, 40, $this->gated('7')));
+
+            $this->assertCount(2, $this->published, $strategy);
+            $this->assertSame([self::BODY, self::BODY], [$this->published[0][0], $this->published[1][0]], $strategy);
+        }
+    }
+
+    public function test_a_version_gated_delivery_is_acked_dropped_and_logged_without_a_publisher(): void
+    {
+        foreach (['fail', 'release', 'dead_letter'] as $strategy) {
+            $this->dropped = [];
+
+            (new Dispatcher($strategy, 3, onDrop: $this->onDrop()))($this->pulsar(self::BODY, 5, $this->gated('7')));
+
+            $this->assertCount(1, $this->dropped, $strategy);
+            $this->assertStringNotContainsString('order_id', $this->dropped[0], 'a drop never carries the body');
+        }
+    }
+
+    public function test_a_version_gated_delivery_under_delete_is_a_silent_ack_even_with_a_publisher(): void
+    {
+        (new Dispatcher('delete', 3, $this->publisher(), onDrop: $this->onDrop()))($this->pulsar(self::BODY, 0, $this->gated()));
+
+        $this->assertSame([], $this->published);
+        $this->assertSame([], $this->dropped);
+    }
+
+    public function test_a_version_gated_delivery_whose_queue_is_unknown_is_acked_dropped_and_logged(): void
+    {
+        (new Dispatcher('fail', 3, $this->publisher(), onDrop: $this->onDrop()))($this->pulsar(self::BODY, 0, $this->gated(), null));
+
+        $this->assertSame([], $this->published, 'nothing is ever written to default.dlq');
+        $this->assertCount(1, $this->dropped);
+    }
+
+    public function test_a_failed_raw_write_of_a_version_gated_delivery_throws_and_never_retries_or_drops(): void
+    {
+        $transport = Mockery::mock(Transport::class);
+        $transport->shouldReceive('publish')->once()->andThrow(new RuntimeException('broker down'));
+        $retried = 0;
+
+        $dispatcher = new Dispatcher('fail', 3, new DeadLetterPublisher($transport), onRetry: function () use (&$retried): void {
+            $retried++;
+        }, onDrop: $this->onDrop());
+
+        try {
+            $dispatcher($this->pulsar(self::BODY, 0, $this->gated()));
+            $this->fail('the failed write must surface so the delivery stays unsettled');
+        } catch (\BabelQueue\Consume\DeadLetterWriteFailed) {
+            $this->assertSame(0, $retried);
+            $this->assertSame([], $this->dropped);
+        }
+    }
+
+    public function test_a_version_gated_kafka_record_keeps_the_unknown_urn_path(): void
+    {
+        $message = new KafkaMessage([], [], self::BODY, PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX . '2', null, 'orders');
+
+        $this->expectException(UnknownUrnException::class);
+        (new Dispatcher('fail', 3))($message);
     }
 
     // -- Kafka: the Dispatcher never drops ------------------------------------------------------------

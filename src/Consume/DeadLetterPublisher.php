@@ -81,6 +81,26 @@ final class DeadLetterPublisher
         }
     }
 
+    /**
+     * Write the **raw record** of a version-gated delivery (ADR-0037 decision 1 rule 4) to `<queue>.dlq`: the body
+     * exactly as received, byte for byte, with no `dead_letter` block, no re-encoding and no ADR-0035 wrapping.
+     * The target is the caller's `$queue` (the consumer's topic), never `default.dlq`. The incoming routing
+     * properties ride on the record as for any other record (never `bq-attempts` and `bq-schema-version`, so a
+     * redrive of the record is not gated again).
+     *
+     * @throws DeadLetterWriteFailed When the transport fails to write the record
+     */
+    public function publishRaw(ConsumedMessage $message, string $body, string $queue): void
+    {
+        $destination = $queue . $this->suffix;
+
+        try {
+            $this->write($message, $body, $destination);
+        } catch (Throwable $writeError) {
+            throw DeadLetterWriteFailed::forQueue($destination, $writeError);
+        }
+    }
+
     private function write(ConsumedMessage $message, string $body, string $destination): void
     {
         // Carry the original broker record key (Kafka) onto the DLQ copy when there is one and the

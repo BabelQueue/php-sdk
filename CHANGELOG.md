@@ -9,6 +9,36 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0037 decision 1 (the version-gate settle rule, Pulsar §5.7) for the PHP core against conformance
+v1.8.0 (new sections `version_gate_pulsar`, `version_gate_sqs`, `version_gate_artemis`). The envelope stays at
+`schema_version: 1`. This is a **MINOR** with a behaviour change.
+
+### Behaviour changes
+- **A version-gated Pulsar delivery is settled on its first delivery (ADR-0037 decision 1).** A delivery whose
+  `bq-schema-version` property is present, non-blank and not `"1"` used to take the `Dispatcher`'s unknown-URN
+  path, so under `fail` / `release` it was retried through the bounded `maxAttempts` re-publish before the terminal
+  decision. It now never reaches a handler, an unknown-URN decision or a retry, whatever `bq-attempts`, the
+  redelivery count or `maxAttempts` say: `on_unknown_urn: delete` acks and drops; with no `DeadLetterPublisher`
+  (or a queue that cannot be named) it acks, drops and logs through `$onDrop` (the `dead_letter` strategy degrades
+  to `delete` the same way); otherwise the **raw record** (the body byte for byte, no `dead_letter` block, no
+  ADR-0035 wrapping; the incoming routing properties ride on it except `bq-attempts` and `bq-schema-version`) is
+  written to `<queue>.dlq` and the delivery is acked. The record used to be the `{"raw": ...}` envelope with a
+  `dead_letter` block, `reason: "unknown_urn"`. `fail` and `release` behave alike (a version-gated delivery is
+  never released). A failed write throws `DeadLetterWriteFailed`, so `PulsarConsumer::consume()` negatively
+  acknowledges the delivery (unsettled, never acked, never a retry copy); the gate rejects the redelivery again,
+  so the write is retried. The gate reads only the configured strategy. Kafka is out of scope (a version-gated
+  Kafka record keeps the unknown-URN path).
+
+### Added
+- `DeadLetterPublisher::publishRaw()`: writes a raw, unannotated record to `<queue>.dlq`.
+- `tests/VersionGateConformanceTest.php`: `version_gate_pulsar` runs through the real `PulsarConsumer` and
+  `Dispatcher`; `version_gate_sqs` and `version_gate_artemis` are reported as `skip` citing ADR-0037 (the
+  `SqsTransport` and `StompTransport` only produce and have no consumer). `version_gate_asb` is absent from the
+  results (no Azure Service Bus binding, ADR-0021).
+
+### Changed
+- The vendored conformance suite and the workflow pin move to conformance v1.8.0.
+
 ## [1.26.0] - 2026-10-25
 
 Implements ADR-0036 decisions 3, 4 and 8 for the PHP core against conformance v1.7.0 (new sections
