@@ -72,6 +72,17 @@ use Throwable;
  * acks and drops; with no publisher `fail`/`release` take the bounded path above (a poison body is
  * never released forever) and `dead_letter` acks, drops and logs (rethrows on Kafka).
  *
+ * **Version gate (ADR-0037 decision 1, Pulsar §5.7).** A {@see PulsarMessage} whose `bq-schema-version` property is
+ * present, non-blank and not the supported version ({@see PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX}) is neither an
+ * unknown URN nor poison: it is settled on its **first** delivery, without a handler, an `onUnknownUrn` hook or a retry,
+ * whatever `bq-attempts`, the redelivery count or `$maxAttempts` say. `delete` acks and drops; with no publisher (or no
+ * nameable queue) it acks, drops and logs (the `dead_letter` strategy degrades to `delete` the same way); otherwise the
+ * **raw record** (the body byte for byte, no `dead_letter` block, {@see DeadLetterPublisher::publishRaw()}) goes to
+ * `<queue>.dlq` and the message is acked. A failed write throws {@see DeadLetterWriteFailed}, which leaves the delivery
+ * unsettled (the consumer negatively acknowledges it); the gate rejects the redelivery again, so the write is retried.
+ * `fail` and `release` behave alike (a version-gated delivery is never released). Kafka is out of scope of this rule: a
+ * version-gated Kafka record keeps the unknown-URN path.
+ *
  * A drop is logged through `$onDrop($message, $why)` (default: `error_log`); it never carries the body.
  *
  * **Retry backoff (ADR-0034 §9, opt-in).** Hand it a {@see RetryBackoff} and a consumer that releases
@@ -142,6 +153,12 @@ final class Dispatcher
      */
     public function __invoke(ConsumedMessage $message): void
     {
+        if ($this->isVersionGated($message)) {
+            $this->handleVersionGated($message);
+
+            return;
+        }
+
         if ($this->isPoison($message)) {
             $this->handlePoison($message);
 
@@ -224,6 +241,40 @@ final class Dispatcher
         $raw = $message->rawBody();
 
         return $raw !== null && StrictBodyClassifier::isPoison($raw);
+    }
+
+    /**
+     * A Pulsar delivery rejected by the §5.7 `bq-schema-version` property gate (the body was never decoded).
+     */
+    private function isVersionGated(ConsumedMessage $message): bool
+    {
+        return $message instanceof PulsarMessage
+            && str_starts_with($message->getUrn(), PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX);
+    }
+
+    /**
+     * ADR-0037 decision 1: settle a version-gated delivery on its first delivery. Only the *configured* strategy is
+     * read (`fail` when none is); `fail` and `release` are alike. Never decodes, never calls a handler, never retries.
+     *
+     * @throws DeadLetterWriteFailed When the raw record cannot be written (the delivery stays unsettled)
+     */
+    private function handleVersionGated(ConsumedMessage $message): void
+    {
+        if ($this->onUnknownUrn === UnknownUrnStrategy::DELETE) {
+            return; // ack + drop (the explicit strategy: nothing to log)
+        }
+
+        $queue = $this->queueOf($message);
+        $body = $message instanceof HasRawBody ? $message->rawBody() : null;
+
+        if ($this->deadLetters === null || $queue === null || $queue === '' || $body === null) {
+            // Dead-lettering is off (or the record cannot be addressed): ack, drop and log, visibly.
+            $this->drop($message, 'unsupported bq-schema-version, no dead-letter publisher can write the raw record');
+
+            return;
+        }
+
+        $this->deadLetters->publishRaw($message, $body, $queue);
     }
 
     private function handlePoison(ConsumedMessage $message): void

@@ -7,7 +7,6 @@ namespace BabelQueue\Tests;
 use BabelQueue\Consume\DeadLetterPublisher;
 use BabelQueue\Consume\Dispatcher;
 use BabelQueue\Contracts\Transport;
-use BabelQueue\Exceptions\UnknownUrnException;
 use BabelQueue\Transport\PulsarConsumer;
 use BabelQueue\Transport\PulsarMessage;
 use BabelQueue\Transport\PulsarWebSocketConsumerClient;
@@ -452,55 +451,78 @@ final class PulsarConsumerTest extends TestCase
         $this->assertSame(0, $calls);
     }
 
-    public function test_a_gated_message_never_reaches_a_handler_and_releases_via_the_unknown_urn_path(): void
+    public function test_a_gated_message_never_reaches_a_handler_and_is_acked_on_its_first_delivery(): void
     {
+        // ADR-0037 decision 1: no retry, no negative acknowledgement, whatever the redelivery count says.
         $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
         $client->shouldReceive('receive')->once()->andReturn(
-            $this->raw('{not json', 0, ['bq-schema-version' => '2', 'bq-job' => 'urn:babel:orders:created']),
+            $this->raw('{not json', 9, ['bq-schema-version' => '2', 'bq-job' => 'urn:babel:orders:created', 'bq-attempts' => '7']),
         );
-        $client->shouldReceive('negativeAcknowledge')->once()->with('mid-1');
-        $client->shouldReceive('acknowledge')->never();
+        $client->shouldReceive('acknowledge')->once()->with('mid-1');
+        $client->shouldReceive('negativeAcknowledge')->never();
 
         $handled = false;
-        $dispatcher = (new Dispatcher())->on('urn:babel:orders:created', function () use (&$handled): void {
+        $dispatcher = (new Dispatcher(onDrop: static function (): void {
+        }))->on('urn:babel:orders:created', function () use (&$handled): void {
             $handled = true;
         });
 
         $calls = 0;
-        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume(function (PulsarMessage $m) use ($dispatcher): void {
-            try {
-                $dispatcher($m);
-            } catch (UnknownUrnException $e) {
-                $this->assertStringContainsString('babelqueue:unsupported-schema-version:2', $e->getMessage());
-
-                throw $e; // consume() releases on a throwing handler
-            }
-        }, function () use (&$calls): bool {
+        (new PulsarConsumer($client, subscriptionType: 'Shared'))->consume($dispatcher, function () use (&$calls): bool {
             return $calls++ >= 1;
         });
 
         $this->assertFalse($handled);
     }
 
-    public function test_a_gated_message_is_dead_lettered_with_its_original_bytes(): void
+    public function test_a_gated_message_is_dead_lettered_with_its_original_bytes_and_acked(): void
     {
-        $body = $this->envelopeWith('urn:babel:orders:created');
-        $message = $this->receiveWith($body, ['bq-schema-version' => 'x'], 0, null, 'orders');
+        $body = "{\n  \"job\": \"urn:babel:orders:created\",\n  \"meta\": { \"schema_version\": 2 }\n}\n";
+        $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn(
+            $this->raw($body, 0, ['bq-schema-version' => 'x', 'bq-job' => 'urn:babel:orders:created']),
+        );
+        $client->shouldReceive('acknowledge')->once()->with('mid-1');
+        $client->shouldReceive('negativeAcknowledge')->never();
 
         $published = [];
         $transport = Mockery::mock(Transport::class);
         $transport->shouldReceive('publish')->once()->andReturnUsing(function (string $payload, string $queue) use (&$published): void {
-            $published = [json_decode($payload, true), $queue, $payload];
+            $published = [$payload, $queue];
         });
 
-        (new Dispatcher('dead_letter', 0, new DeadLetterPublisher($transport)))($message);
+        $calls = 0;
+        (new PulsarConsumer($client, queue: 'orders', subscriptionType: 'Shared'))->consume(
+            new Dispatcher('dead_letter', 0, new DeadLetterPublisher($transport)),
+            function () use (&$calls): bool {
+                return $calls++ >= 1;
+            },
+        );
 
-        $this->assertSame($body, $published[0]['raw']);
-        $this->assertSame('unknown_urn', $published[0]['dead_letter']['reason']);
-        // The sentinel URN is an in-process marker: the dead-letter record never carries it.
-        $this->assertStringNotContainsString('"job":"babelqueue:unsupported-schema-version', $published[2]);
-        $this->assertArrayNotHasKey('job', $published[0]);
-        // The gate does not decode the body, so `meta.queue` is unknown: the queue is the consumer's.
-        $this->assertSame('orders.dlq', $published[1]);
+        // The raw record: the body exactly as received, no `dead_letter` block, to the consumer's queue.
+        $this->assertSame([$body, 'orders.dlq'], $published);
+    }
+
+    public function test_a_failed_dlq_write_of_a_gated_message_leaves_it_unsettled_and_never_retries(): void
+    {
+        $client = Mockery::mock(PulsarWebSocketConsumerClient::class);
+        $client->shouldReceive('receive')->once()->andReturn($this->raw('{not json', 0, ['bq-schema-version' => '2']));
+        $client->shouldReceive('negativeAcknowledge')->once()->with('mid-1');
+        $client->shouldReceive('acknowledge')->never();
+
+        $transport = Mockery::mock(Transport::class);
+        $transport->shouldReceive('publish')->once()->andThrow(new RuntimeException('broker down'));
+
+        // Exclusive: a retry would be a re-publish through this producer; it must never be used.
+        $producer = Mockery::mock(\BabelQueue\Transport\PulsarWebSocketClient::class);
+        $producer->shouldReceive('publish')->never();
+
+        $calls = 0;
+        (new PulsarConsumer($client, queue: 'orders', retryProducer: $producer, tenant: 'public', namespace: 'default', subscriptionType: 'Exclusive'))->consume(
+            new Dispatcher('fail', 3, new DeadLetterPublisher($transport)),
+            function () use (&$calls): bool {
+                return $calls++ >= 1;
+            },
+        );
     }
 }

@@ -329,16 +329,24 @@ A plain `publish()` (no tracer) is unchanged on every transport.
 body. A missing or blank value (empty, or only ASCII whitespace; not `trim()`, so NBSP, U+3000 and similar are
 *not* blank) takes the normal decode path. Any other value is compared as-is (no trimming) to `"1"`; anything
 else is rejected without decoding. A rejected record reaches the `Dispatcher` as a message routed on
-`babelqueue:unsupported-schema-version:<value>` (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`), so it takes the
-unknown-URN path (never a handler) and its dead-letter copy keeps the original bytes.
+`babelqueue:unsupported-schema-version:<value>` (`KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX` /
+`PulsarConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX`) and never reaches a handler. On Kafka it takes the unknown-URN
+path and its dead-letter copy keeps the original bytes; on Pulsar it is settled on its first delivery (next paragraph).
+
+**Pulsar settles a rejected delivery on its first delivery (ADR-0037 decision 1).** On Pulsar the `Dispatcher`
+neither retries it nor treats it as an unknown URN, whatever `bq-attempts`, the redelivery count or `maxAttempts`
+say: `on_unknown_urn: delete` acks and drops it; with no `DeadLetterPublisher` (or no nameable queue) it is
+acknowledged, dropped and logged; otherwise the **raw record** (the original bytes, no `dead_letter` block) is
+written to `<queue>.dlq` and the delivery is acknowledged. If that write fails the delivery stays unsettled (a
+negative acknowledgement) and the write is tried again on the redelivery. A Kafka record keeps the unknown-URN path.
 
 ## Pulsar consumer: retry, queue name and subscription type
 
 `PulsarConsumer` + `Consume\Dispatcher` bound every message (`maxAttempts`, default 3; ADR-0036). A failing
 handler is retried by **re-publishing** the message to the same topic with `bq-attempts` + 1 and acknowledging the
 original, not by a negative acknowledgement: on an `Exclusive` / `Failover` subscription a nack does not advance
-Pulsar's redelivery count, so a nack-only retry would never reach the cap. A poison or version-gated body keeps its
-exact bytes and properties on the way.
+Pulsar's redelivery count, so a nack-only retry would never reach the cap. A poison body keeps its exact bytes and
+properties on the way (a version-gated delivery is never retried by the `Dispatcher`, see above).
 
 The consumer derives what it needs from your `PulsarWebSocketConsumerClient` adapter, and anything you pass
 explicitly wins; an adapter that implements the two interfaces below needs no configuration at all.
