@@ -22,8 +22,8 @@ use BabelQueue\Contracts\HasRecordKey;
  * ({@see KafkaRetryRouter}) reads to recover the **work topic** of a record already in the retry
  * chain (`bq-original-topic`) so retries route back to the right work topic across hops. Because it
  * surfaces those record headers via {@see HasHeaders}, it is the consume-side hook through which a
- * carried W3C `traceparent` would reach {@see \BabelQueue\Otel\Tracing::wrap()} once a Kafka
- * producer injects one (ADR-0028; the Kafka producer-side wiring is a documented follow-up).
+ * W3C `traceparent` carried by {@see KafkaTransport::publishWithHeaders()} reaches
+ * {@see \BabelQueue\Otel\Tracing::wrap()} (ADR-0028).
  *
  * For a record rejected by the §6.7 `bq-schema-version` gate the body is never decoded: the routing
  * URN is {@see KafkaConsumer::UNSUPPORTED_SCHEMA_URN_PREFIX} plus the rejected value and the envelope

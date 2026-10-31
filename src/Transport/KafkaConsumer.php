@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\Contracts\DeadLetterObserver;
 use BabelQueue\DeadLetter\PoisonBody;
 use Throwable;
 
@@ -71,12 +72,15 @@ final class KafkaConsumer
      * @param  string  $dlqSuffix  the dead-letter-topic suffix (`<topic>.dlq`)
      * @param  string|null  $topic  the topic this consumer reads, used when a record frame carries no `topic`; null = ask
      *                              the client ({@see KafkaSubscriptionDescriptor}, single-topic subscriptions only)
+     * @param  DeadLetterObserver|null  $observer  told once per poison record the producer accepted for `<topic>.dlq`
+     *                                              (ADR-0039 section 5.1); a throwing observer is logged and ignored
      */
     public function __construct(
         private readonly KafkaConsumerClient $client,
         private readonly ?KafkaProducer $deadLetterProducer = null,
         private readonly string $dlqSuffix = '.dlq',
         private readonly ?string $topic = null,
+        private readonly ?DeadLetterObserver $observer = null,
     ) {
     }
 
@@ -191,9 +195,28 @@ final class KafkaConsumer
                 (int) round(microtime(true) * 1000),
                 $raw['key'] ?? null,
             );
+
+            $this->notify($topic, $topic . $this->dlqSuffix);
         }
 
         $this->commit();
+    }
+
+    /**
+     * Tell the observer about a poison record the producer accepted. Whatever it throws is logged and dropped:
+     * it must not change the settle outcome, so the commit that follows always runs (ADR-0039 section 5.1).
+     */
+    private function notify(string $topic, string $deadLetterTopic): void
+    {
+        if ($this->observer === null) {
+            return;
+        }
+
+        try {
+            $this->observer->deadLettered($topic, $deadLetterTopic, 'poison');
+        } catch (Throwable $e) {
+            error_log('[babelqueue] The dead-letter observer failed and was ignored: ' . $e::class . ': ' . $e->getMessage());
+        }
     }
 
     /**

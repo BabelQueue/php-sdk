@@ -7,6 +7,7 @@ namespace BabelQueue\Consume;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Codec\StrictBodyClassifier;
 use BabelQueue\Contracts\ConsumedMessage;
+use BabelQueue\Contracts\DeadLetterObserver;
 use BabelQueue\Contracts\HasMessageProperties;
 use BabelQueue\Contracts\HasRawBody;
 use BabelQueue\Contracts\HasRecordKey;
@@ -23,12 +24,17 @@ use Throwable;
  * envelope with the additive `dead_letter` block ({@see DeadLetter::annotate}, ADR-0009) and
  * publishes it, via any {@see Transport}, to `<original_queue>.dlq` (the default naming all SDKs
  * share). The body stays byte-identical; the block is additive, so `schema_version` remains 1.
+ *
+ * An optional {@see DeadLetterObserver} (ADR-0039 section 5.1) is told once per record the transport
+ * confirmed, after the write; a failed write never reaches it, and an observer that throws is logged and
+ * ignored, so it can never change how the message is settled.
  */
 final class DeadLetterPublisher
 {
     public function __construct(
         private readonly Transport $transport,
         private readonly string $suffix = '.dlq',
+        private readonly ?DeadLetterObserver $observer = null,
     ) {
     }
 
@@ -79,6 +85,8 @@ final class DeadLetterPublisher
         } catch (Throwable $writeError) {
             throw DeadLetterWriteFailed::forQueue($target . $this->suffix, $writeError);
         }
+
+        $this->notify($target, $target . $this->suffix, $reason);
     }
 
     /**
@@ -98,6 +106,26 @@ final class DeadLetterPublisher
             $this->write($message, $body, $destination);
         } catch (Throwable $writeError) {
             throw DeadLetterWriteFailed::forQueue($destination, $writeError);
+        }
+
+        // A raw record carries no `dead_letter` block, so there is no reason to report (ADR-0039 section 5.1).
+        $this->notify($queue, $destination, '');
+    }
+
+    /**
+     * Tell the observer about a confirmed write. Whatever it throws is logged and dropped: it must not
+     * change the settle outcome (ADR-0039 section 5.1).
+     */
+    private function notify(string $queue, string $deadLetterQueue, string $reason): void
+    {
+        if ($this->observer === null) {
+            return;
+        }
+
+        try {
+            $this->observer->deadLettered($queue, $deadLetterQueue, $reason);
+        } catch (Throwable $e) {
+            error_log('[babelqueue] The dead-letter observer failed and was ignored: ' . $e::class . ': ' . $e->getMessage());
         }
     }
 

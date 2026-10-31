@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace BabelQueue\Transport;
 
 use BabelQueue\Codec\EnvelopeCodec;
+use BabelQueue\Contracts\DeadLetterObserver;
 use BabelQueue\DeadLetter\DeadLetter;
 use BabelQueue\Exceptions\BabelQueueException;
+use BabelQueue\Support\Headers;
 use Throwable;
 
 /**
@@ -74,6 +76,9 @@ final class KafkaRetryRouter
      *                              tier index)
      * @param  string  $dlqSuffix  the dead-letter-topic suffix (`<workTopic>.dlq`)
      * @param  string  $topicPrefix  the §6.1 logical-queue → topic prefix (matches the producer's)
+     * @param  DeadLetterObserver|null  $observer  told once per `<workTopic>.dlq` record the producer confirmed
+     *                                              (attempts exhausted; ADR-0039 section 5.1); a throwing observer
+     *                                              is logged and ignored
      */
     public function __construct(
         private readonly KafkaProducer $producer,
@@ -82,6 +87,7 @@ final class KafkaRetryRouter
         private readonly string $retryInfix = '.retry.',
         private readonly string $dlqSuffix = '.dlq',
         private readonly string $topicPrefix = '',
+        private readonly ?DeadLetterObserver $observer = null,
     ) {
         sort($delayTiersMs);
         $this->delayTiersMs = $delayTiersMs;
@@ -116,7 +122,7 @@ final class KafkaRetryRouter
         $nowMs = $this->nowMs();
 
         if ($delayMs !== null) {
-            $this->defer($envelope, $workTopic, $delayMs, $nowMs, $message->recordKey());
+            $this->defer($envelope, $workTopic, $delayMs, $nowMs, $message->recordKey(), self::traceHeaders($message));
 
             return true;
         }
@@ -129,7 +135,7 @@ final class KafkaRetryRouter
             return false;
         }
 
-        $this->retry($envelope, $workTopic, $next, $nowMs, $message->recordKey());
+        $this->retry($envelope, $workTopic, $next, $nowMs, $message->recordKey(), self::traceHeaders($message));
 
         return true;
     }
@@ -147,8 +153,9 @@ final class KafkaRetryRouter
      * to `$next` and the `bq-delay` / `bq-original-topic` re-injection headers attached.
      *
      * @param  array<string, mixed>  $envelope
+     * @param  array<string, string>  $trace  the inbound W3C trace headers to carry onto the retry record
      */
-    private function retry(array $envelope, string $workTopic, int $next, int $nowMs, ?string $key): void
+    private function retry(array $envelope, string $workTopic, int $next, int $nowMs, ?string $key, array $trace = []): void
     {
         $this->requireTiers();
 
@@ -156,7 +163,7 @@ final class KafkaRetryRouter
         $tierMs = $this->delayTiersMs[$tierIndex];
         $envelope['attempts'] = $next;
 
-        $headers = $this->headers($envelope, $next);
+        $headers = $this->headers($envelope, $next) + $trace;
         $headers['bq-delay'] = (string) $tierMs;
         $headers['bq-original-topic'] = $workTopic;
 
@@ -175,8 +182,9 @@ final class KafkaRetryRouter
      * leaving `attempts` untouched.
      *
      * @param  array<string, mixed>  $envelope
+     * @param  array<string, string>  $trace  the inbound W3C trace headers to carry onto the deferred record
      */
-    private function defer(array $envelope, string $workTopic, int $delayMs, int $nowMs, ?string $key): void
+    private function defer(array $envelope, string $workTopic, int $delayMs, int $nowMs, ?string $key, array $trace = []): void
     {
         $this->requireTiers();
 
@@ -197,7 +205,7 @@ final class KafkaRetryRouter
         }
 
         $attempts = $envelope['attempts'] ?? 0;
-        $headers = $this->headers($envelope, is_int($attempts) ? $attempts : 0);
+        $headers = $this->headers($envelope, is_int($attempts) ? $attempts : 0) + $trace;
         $headers['bq-delay'] = (string) $delayMs;
         $headers['bq-original-topic'] = $workTopic;
 
@@ -236,6 +244,45 @@ final class KafkaRetryRouter
             $nowMs,
             $key,
         );
+
+        $this->notify($queue, $workTopic . $this->dlqSuffix);
+    }
+
+    /**
+     * Tell the observer about a DLQ record the producer accepted. Whatever it throws is logged and dropped:
+     * it must not change the settle outcome (ADR-0039 section 5.1).
+     */
+    private function notify(string $queue, string $deadLetterTopic): void
+    {
+        if ($this->observer === null) {
+            return;
+        }
+
+        try {
+            $this->observer->deadLettered($queue, $deadLetterTopic, 'failed');
+        } catch (Throwable $e) {
+            error_log('[babelqueue] The dead-letter observer failed and was ignored: ' . $e::class . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * The W3C trace headers (`traceparent`, `tracestate`) of the inbound record, so a retried or deferred message
+     * stays in the same trace (ADR-0028; the re-inject consumer keeps them, §6.4). Nothing else is copied: the `bq-`
+     * projection of the new record is derived from its own body, never from the inbound headers.
+     *
+     * @return array<string, string>
+     */
+    private static function traceHeaders(KafkaMessage $message): array
+    {
+        $trace = [];
+        $inbound = Headers::sanitize($message->headers());
+        foreach (['traceparent', 'tracestate'] as $name) {
+            if (isset($inbound[$name])) {
+                $trace[$name] = $inbound[$name];
+            }
+        }
+
+        return $trace;
     }
 
     /**
