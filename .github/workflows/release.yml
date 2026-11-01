@@ -72,7 +72,7 @@ jobs:
           PY
 
       - name: Upload results.json
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-results
           path: ${{ runner.temp }}/results.json
