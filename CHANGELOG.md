@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.28.0] - 2026-11-01
+
 Implements ADR-0038 (OpenTelemetry semantic-conventions alignment) and ADR-0039 (standard metrics and the
 dead-letter observer) for the PHP `Otel` module, and makes `KafkaTransport` and `StompTransport` carry a W3C
 `traceparent` (R1-O3). Runs against conformance v1.9.0 (sections `span-shape`, `trace-id` and `metrics`, plus six
