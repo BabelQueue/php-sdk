@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BabelQueue\Tests;
 
+use ArrayObject;
 use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\DeadLetter\DeadLetter;
 use BabelQueue\DeadLetter\PoisonBody;
@@ -11,6 +12,7 @@ use BabelQueue\Exceptions\BabelQueueException;
 use BabelQueue\Exceptions\InvalidEnvelopeException;
 use BabelQueue\Idempotency\Idempotent;
 use BabelQueue\Idempotency\InMemoryStore;
+use BabelQueue\Otel\Metrics;
 use BabelQueue\Otel\Tracing;
 use BabelQueue\Tests\Support\ConformanceResults;
 use BabelQueue\Tests\Support\EnvelopeMessage;
@@ -26,7 +28,20 @@ use BabelQueue\Transport\SqsClient;
 use BabelQueue\Transport\SqsTransport;
 use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
+use OpenTelemetry\API\Metrics\MeterInterface;
 use OpenTelemetry\API\Trace\Span;
+use OpenTelemetry\API\Trace\SpanKind;
+use OpenTelemetry\API\Trace\StatusCode;
+use OpenTelemetry\SDK\Metrics\Data\Histogram;
+use OpenTelemetry\SDK\Metrics\Data\Metric;
+use OpenTelemetry\SDK\Metrics\Data\Sum;
+use OpenTelemetry\SDK\Metrics\MeterProvider;
+use OpenTelemetry\SDK\Metrics\MetricExporter\InMemoryExporter as MetricMemoryExporter;
+use OpenTelemetry\SDK\Metrics\MetricReader\ExportingReader;
+use OpenTelemetry\SDK\Trace\ImmutableSpan;
+use OpenTelemetry\SDK\Trace\SpanExporter\InMemoryExporter as SpanMemoryExporter;
+use OpenTelemetry\SDK\Trace\SpanProcessor\SimpleSpanProcessor;
+use OpenTelemetry\SDK\Trace\TracerProvider;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PHPUnit\Framework\TestCase;
@@ -36,7 +51,7 @@ use Predis\ClientInterface;
  * Runs the broker-free sections of the vendored cross-SDK conformance manifest and records every
  * case for `results.json` (ADR-0032): `cases`, `roundtrip`, `data_shape`, `forbidden_keys`,
  * `extension_write`, `encode_reject`, `payload_schema_unicode`, `trim`, `job_type`, `idempotency`,
- * `traceparent`, `redis`, `redis_layout`, `rabbitmq`, `delay`, `backoff`, `retry_backoff`, `redis_delay` and `kafka_poison`.
+ * `traceparent`, `span-shape`, `trace-id`, `metrics`, `redis`, `redis_layout`, `rabbitmq`, `delay`, `backoff`, `retry_backoff`, `redis_delay` and `kafka_poison`.
  *
  * Re-encoded output is parsed with objects kept as stdClass so the comparison is
  * type-strict ({} is not [], 1 is not 1.0 or true); object key order is ignored.
@@ -392,6 +407,499 @@ final class BehaviourConformanceTest extends TestCase
             self::assertSame(str_replace('-', '', (string) $case['trace_id']), $expect['trace_id_hex'], $name . ': fixture consistency');
             self::assertSame($expect['trace_id_hex'], Tracing::traceIdOf((string) $case['trace_id']), $name . ': trace id from trace_id');
         });
+    }
+
+    /**
+     * ADR-0038 section 4 and 5: the producer span (`send <queue>`) and the consumer span (`process <queue>`) for one
+     * message, built through the real `Tracing::publish()` / `Tracing::wrap()` and read back from an in-memory span
+     * exporter. Every listed attribute is exact, a table key that is not listed must be absent, an extra `babelqueue.*`
+     * key is forbidden, `error.type` is asserted for presence only, and the `$produced.*` placeholders come from the
+     * envelope the transport was handed.
+     */
+    public function test_span_shape_cases(): void
+    {
+        ConformanceResults::each('span-shape', function (array $case): void {
+            $name = (string) ($case['name'] ?? '');
+            self::assertSame('span', $case['mode'], $name . ': mode');
+
+            /** @var ArrayObject<int, ImmutableSpan> $storage */
+            $storage = new ArrayObject();
+            $provider = new TracerProvider(new SimpleSpanProcessor(new SpanMemoryExporter($storage)));
+            $tracer = $provider->getTracer('conformance', null, Tracing::SCHEMA_URL);
+            $failing = $case['outcome'] === 'error';
+
+            $options = [];
+            if (array_key_exists('system', $case)) {
+                $options['system'] = $case['system'];
+            }
+
+            $produced = null;
+            $threw = false;
+            if ($case['operation'] === 'send') {
+                $transport = new ConformanceSpanTransport(($case['envelope_built'] ?? true) !== false && $failing);
+                $arguments = ['tracer' => $tracer, 'transport' => $transport, 'urn' => $case['urn']] + $options;
+                if (array_key_exists('queue', $case)) {
+                    $arguments['queue'] = $case['queue'];
+                }
+                if (($case['envelope_built'] ?? true) === false) {
+                    // Invalid UTF-8 makes the encode fail, so no envelope ever reaches the transport.
+                    $arguments['data'] = ['bad' => "\xB1"];
+                }
+
+                try {
+                    Tracing::publish(...$arguments);
+                } catch (\Throwable) {
+                    $threw = true;
+                }
+                if ($transport->payload !== null) {
+                    $decoded = json_decode($transport->payload, true);
+                    self::assertIsArray($decoded);
+                    $produced = $decoded;
+                }
+            } else {
+                $meta = ['lang' => 'php'];
+                foreach (['message_id' => 'id', 'queue' => 'queue', 'schema_version' => 'schema_version'] as $input => $key) {
+                    if (array_key_exists($input, $case)) {
+                        $meta[$key] = $case[$input];
+                    }
+                }
+                if (array_key_exists('consumer_group', $case)) {
+                    $options['consumerGroup'] = $case['consumer_group'];
+                }
+                $message = new EnvelopeMessage([
+                    'job' => $case['urn'],
+                    'trace_id' => $case['trace_id'],
+                    'data' => [],
+                    'meta' => $meta,
+                    'attempts' => $case['attempts'] ?? 0,
+                ]);
+                $handler = Tracing::wrap($tracer, static function () use ($failing): void {
+                    if ($failing) {
+                        throw new \RuntimeException('handler failed');
+                    }
+                }, ...$options);
+
+                try {
+                    $handler($message);
+                } catch (\Throwable) {
+                    $threw = true;
+                }
+            }
+            $provider->forceFlush();
+
+            self::assertSame($failing, $threw, $name . ': the failure is surfaced to the caller unchanged');
+            self::assertCount(1, $storage, $name . ': exactly one span');
+            $span = $storage[0];
+            self::assertInstanceOf(ImmutableSpan::class, $span);
+            $this->assertSpanShape($name, $span, $case['expect'], $produced);
+        });
+    }
+
+    /**
+     * @param  array<string, mixed>  $expect
+     * @param  array<string, mixed>|null  $produced  the envelope handed to the transport (send cases)
+     */
+    private function assertSpanShape(string $name, ImmutableSpan $span, array $expect, ?array $produced): void
+    {
+        $tableKeys = [
+            'messaging.system', 'messaging.operation.type', 'messaging.operation.name', 'messaging.destination.name',
+            'messaging.message.id', 'messaging.message.conversation_id', 'messaging.consumer.group.name', 'babelqueue.urn',
+            'babelqueue.schema_version', 'babelqueue.attempts', 'error.type', 'messaging.operation', 'messaging.babelqueue.attempts',
+        ];
+
+        // Placeholders: the runner reads the produced envelope. A blank produced queue means no destination.
+        $producedMeta = is_array($produced['meta'] ?? null) ? $produced['meta'] : [];
+        $producedQueue = is_string($producedMeta['queue'] ?? null) ? $producedMeta['queue'] : '';
+        $queueUsable = trim($producedQueue, " \t\n\x0B\f\r") !== '';
+        $resolve = static fn (mixed $value): mixed => match ($value) {
+            '$produced.meta.id' => $producedMeta['id'] ?? null,
+            '$produced.trace_id' => $produced['trace_id'] ?? null,
+            default => $value,
+        };
+
+        $attributes = [];
+        foreach ($expect['attributes'] as $key => $value) {
+            if ($value === '$produced.meta.queue') {
+                if ($queueUsable) {
+                    $attributes[$key] = $producedQueue;
+                }
+
+                continue;
+            }
+            $attributes[$key] = $resolve($value);
+        }
+
+        $actual = $span->getAttributes()->toArray();
+        $expectedKind = ['PRODUCER' => SpanKind::KIND_PRODUCER, 'CONSUMER' => SpanKind::KIND_CONSUMER][$expect['span_kind']];
+        self::assertSame($expectedKind, $span->getKind(), $name . ': span kind');
+        self::assertSame($expect['status'] === 'error' ? StatusCode::STATUS_ERROR : StatusCode::STATUS_UNSET, $span->getStatus()->getCode(), $name . ': status');
+
+        // Name: exact, or one of the allowed names; the queue placeholder follows the produced meta.queue.
+        $optional = $expect['optional_attributes'] ?? [];
+        if (isset($expect['span_name'])) {
+            $expectedName = rtrim(str_replace('$produced.meta.queue', $queueUsable ? $producedQueue : '', $expect['span_name']));
+            self::assertSame($expectedName, $span->getName(), $name . ': span name');
+        } else {
+            self::assertContains($span->getName(), $expect['span_name_one_of'], $name . ': span name');
+        }
+        foreach ($optional as $key) {
+            if (array_key_exists($key, $actual)) {
+                $queue = $attributes[$key] ?? ($key === 'messaging.destination.name' ? (string) $actual[$key] : null);
+                self::assertSame('send ' . $actual[$key], $span->getName(), $name . ': the name agrees with the optional ' . $key);
+                self::assertSame($queue, $actual[$key], $name . ': optional ' . $key);
+            } else {
+                self::assertSame('send', $span->getName(), $name . ': no destination, bare name');
+            }
+        }
+
+        foreach ($attributes as $key => $value) {
+            self::assertArrayHasKey($key, $actual, $name . ': attribute ' . $key);
+            self::assertSame($value, $actual[$key], $name . ': attribute ' . $key);
+        }
+        foreach ($tableKeys as $key) {
+            $isErrorType = $key === 'error.type';
+            if (! array_key_exists($key, $attributes) && ! in_array($key, $optional, true) && ! $isErrorType) {
+                self::assertArrayNotHasKey($key, $actual, $name . ': ' . $key . ' must be absent');
+            }
+        }
+        foreach (array_keys($actual) as $key) {
+            if (str_starts_with((string) $key, 'babelqueue.')) {
+                self::assertContains($key, $tableKeys, $name . ': extra babelqueue.* key ' . $key);
+            }
+        }
+
+        if (($expect['error_type'] ?? null) === 'present') {
+            self::assertIsString($actual['error.type'] ?? null, $name . ': error.type');
+            self::assertNotSame('', $actual['error.type'], $name . ': error.type is non-empty');
+        } else {
+            self::assertArrayNotHasKey('error.type', $actual, $name . ': no error.type on success');
+        }
+    }
+
+    /**
+     * ADR-0038 section 7 and message-envelope.md sections 5.1 and 7: a non-UUID `trace_id` is preserved byte for byte
+     * (decode, re-emit, downstream, `make`), and the OTel TraceID mapping decodes a 32-hex value and hashes the rest,
+     * pinned to the Go reference.
+     */
+    public function test_trace_id_cases(): void
+    {
+        $silent = static function (): void {};
+        $body = static fn (string $traceId): string => json_encode([
+            'job' => 'urn:acme:a',
+            'trace_id' => $traceId,
+            'data' => new \stdClass(),
+            'meta' => ['id' => 'i', 'queue' => 'q', 'lang' => 'php', 'schema_version' => 1, 'created_at' => 1],
+            'attempts' => 0,
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
+
+        ConformanceResults::each('trace-id', static function (array $case) use ($silent, $body): void {
+            $name = (string) ($case['name'] ?? '');
+            $expect = $case['expect'];
+
+            switch ($case['mode']) {
+                case 'map':
+                    $hex = Tracing::traceIdOf($case['trace_id']);
+                    self::assertSame($expect['trace_id_hex'], $hex, $name . ': trace id hex');
+                    $expected = $expect['mapping'] === 'decode'
+                        ? strtolower(str_replace('-', '', $case['trace_id']))
+                        : substr(hash('sha256', $case['trace_id']), 0, 32);
+                    self::assertSame($expected, $hex, $name . ': mapping ' . $expect['mapping']);
+
+                    break;
+                case 'decode':
+                    $envelope = EnvelopeCodec::decode($body($case['trace_id']), $silent);
+                    self::assertTrue($expect['decoded'], $name);
+                    self::assertSame($expect['trace_id'], $envelope['trace_id'] ?? null, $name . ': decoded trace_id');
+
+                    break;
+                case 'reemit':
+                    $envelope = EnvelopeCodec::decode($body($case['trace_id']), $silent);
+                    self::assertIsInt($envelope['attempts']);
+                    ++$envelope['attempts'];
+                    $again = EnvelopeCodec::decode(EnvelopeCodec::encode($envelope), $silent);
+                    self::assertSame($expect['trace_id'], $again['trace_id'] ?? null, $name . ': re-emitted trace_id');
+
+                    break;
+                case 'downstream':
+                    $inbound = EnvelopeCodec::decode($body($case['trace_id']), $silent);
+                    $downstream = EnvelopeCodec::make('urn:acme:b', [], 'q', (string) $inbound['trace_id']);
+                    self::assertSame($expect['trace_id'], $downstream['trace_id'], $name . ': downstream trace_id');
+
+                    break;
+                case 'make':
+                    $made = EnvelopeCodec::make($case['urn'], [], 'default', $case['trace_id']);
+                    self::assertSame($expect['trace_id'], $made['trace_id'], $name . ': stored trace_id');
+                    self::assertSame($expect['trace_id_hex'], Tracing::traceIdOf($made['trace_id']), $name . ': trace id hex of the stored value');
+
+                    break;
+                default:
+                    self::fail($name . ': unknown mode ' . $case['mode']);
+            }
+        });
+    }
+
+    /**
+     * ADR-0039: the five instruments, the data points of the consumer wrapper, the producer wrapper and the
+     * dead-letter observer, read back from an in-memory metric reader. The `observer_called: false` cases carry
+     * `sdk_test_required`: no event is delivered, so this runner can only report them `pass`; the rule is enforced
+     * by `DeadLetterObserverTest` for the three PHP write primitives.
+     */
+    public function test_metrics_cases(): void
+    {
+        ConformanceResults::each('metrics', function (array $case): void {
+            $name = (string) ($case['name'] ?? '');
+
+            switch ($case['mode']) {
+                case 'instrument':
+                    $this->assertMetricInstrument($name, $case['expect']);
+
+                    break;
+                case 'publish':
+                case 'consume':
+                    $this->assertMetricRecords($name, $this->driveWrapper($case), $case['expect']['records'], $this->lastProducedQueue);
+
+                    break;
+                case 'dead_letter':
+                    if ($case['observer_called'] === false) {
+                        self::assertTrue($case['sdk_test_required'] ?? false, $name . ': an unobservable rule is enforced by the SDK tests');
+                        self::assertSame([], $case['expect']['records'], $name);
+
+                        break;
+                    }
+                    [$reader, $storage, $meter] = $this->metricHarness();
+                    $event = $case['event'];
+                    (new Metrics($meter, $case['system'] ?? null))->deadLettered($event['queue'], $event['dead_letter_queue'], $event['reason']);
+                    $this->assertMetricRecords($name, $this->collectMetricRecords($reader, $storage), $case['expect']['records'], null);
+
+                    break;
+                default:
+                    self::fail($name . ': unknown mode ' . $case['mode']);
+            }
+        });
+    }
+
+    /** The `meta.queue` of the envelope the last `publish` scenario handed to its transport. */
+    private string $lastProducedQueue = '';
+
+    /**
+     * Run one `publish` or `consume` scenario through the real wrapper and return the recorded data points.
+     *
+     * @param  array<string, mixed>  $case
+     * @return list<array{metric: string, kind: string, value: mixed, attributes: array<string, mixed>}>
+     */
+    private function driveWrapper(array $case): array
+    {
+        [$reader, $storage, $meter] = $this->metricHarness();
+        $tracer = (new TracerProvider())->getTracer('conformance');
+        $options = array_key_exists('system', $case) ? ['system' => $case['system']] : [];
+        if (($case['meter'] ?? true) !== false) {
+            $options['meter'] = $meter;
+        }
+        $failing = $case['outcome'] === 'error';
+        $this->lastProducedQueue = '';
+
+        if ($case['mode'] === 'publish') {
+            $transport = new ConformanceSpanTransport($failing);
+            $arguments = ['tracer' => $tracer, 'transport' => $transport, 'urn' => 'urn:acme:order.created'] + $options;
+            if (array_key_exists('queue', $case)) {
+                $arguments['queue'] = $case['queue'];
+            }
+            try {
+                Tracing::publish(...$arguments);
+            } catch (\Throwable) {
+            }
+            $produced = $transport->payload !== null ? json_decode($transport->payload, true) : null;
+            $producedMeta = is_array($produced) && is_array($produced['meta'] ?? null) ? $produced['meta'] : [];
+            $this->lastProducedQueue = is_string($producedMeta['queue'] ?? null) ? $producedMeta['queue'] : '';
+        } else {
+            $meta = ['id' => 'm1', 'lang' => 'php', 'schema_version' => 1];
+            if (array_key_exists('queue', $case)) {
+                $meta['queue'] = $case['queue'];
+            }
+            $message = new EnvelopeMessage([
+                'job' => 'urn:acme:order.created',
+                'trace_id' => '7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b',
+                'data' => [],
+                'meta' => $meta,
+                'attempts' => $case['attempts'] ?? 0,
+            ]);
+            $handler = Tracing::wrap($tracer, static function () use ($failing): void {
+                if ($failing) {
+                    throw new \RuntimeException('handler failed');
+                }
+            }, ...$options);
+            try {
+                $handler($message);
+            } catch (\Throwable) {
+            }
+        }
+
+        return $this->collectMetricRecords($reader, $storage);
+    }
+
+    /**
+     * One instrument: its name, kind, unit and exact attribute key set, with and without a destination and on a failure.
+     *
+     * @param  array<string, mixed>  $expect
+     */
+    private function assertMetricInstrument(string $name, array $expect): void
+    {
+        $metric = $expect['metric'];
+        $always = $expect['attributes']['always'];
+        $withDestination = $expect['attributes']['when_destination_known'];
+        $onFailure = $expect['attributes']['on_failure'] ?? [];
+
+        foreach ([false, true] as $failure) {
+            if ($failure && $onFailure === []) {
+                continue;
+            }
+            foreach ([false, true] as $destinationKnown) {
+                [$reader, $storage, $meter] = $this->metricHarness();
+                $tracer = (new TracerProvider())->getTracer('conformance');
+                $queue = $destinationKnown ? 'orders.events' : '';
+
+                switch ($metric) {
+                    case 'messaging.client.sent.messages':
+                        try {
+                            Tracing::publish($tracer, new ConformanceSpanTransport($failure), 'urn:acme:a', [], $queue, system: 'kafka', meter: $meter);
+                        } catch (\Throwable) {
+                        }
+
+                        break;
+                    case 'babelqueue.dlq.messages':
+                        (new Metrics($meter, 'kafka'))->deadLettered($queue, 'q.dlq', 'failed');
+
+                        break;
+                    default:
+                        $message = new EnvelopeMessage([
+                            'job' => 'urn:acme:a', 'trace_id' => 't', 'data' => [], 'meta' => ['id' => 'm', 'queue' => $queue, 'schema_version' => 1], 'attempts' => 1,
+                        ]);
+                        try {
+                            Tracing::wrap($tracer, static function () use ($failure): void {
+                                if ($failure) {
+                                    throw new \RuntimeException('handler failed');
+                                }
+                            }, system: 'kafka', meter: $meter)($message);
+                        } catch (\Throwable) {
+                        }
+                }
+
+                $reader->collect();
+                $found = null;
+                foreach ($storage as $candidate) {
+                    if ($candidate->name === $metric) {
+                        $found = $candidate;
+                    }
+                }
+                self::assertNotNull($found, $name . ': the metric exists');
+                self::assertSame($expect['unit'], $found->unit, $name . ': unit');
+                $expectedClass = $expect['instrument'] === 'histogram' ? Histogram::class : Sum::class;
+                self::assertInstanceOf($expectedClass, $found->data, $name . ': instrument kind');
+
+                $keys = array_merge($always, $destinationKnown ? $withDestination : [], $failure ? $onFailure : []);
+                self::assertNotEmpty($found->data->dataPoints, $name . ': a data point was recorded');
+                foreach ($found->data->dataPoints as $point) {
+                    $actual = array_keys($point->attributes->toArray());
+                    self::assertEqualsCanonicalizing($keys, $actual, $name . ': attribute key set');
+                    foreach ($expect['forbidden_attributes'] as $forbidden) {
+                        self::assertNotContains($forbidden, $actual, $name . ': ' . $forbidden . ' must never be a metric attribute');
+                    }
+                    self::assertSame($expect['operation_name'], $point->attributes->toArray()['messaging.operation.name'], $name . ': operation name');
+                }
+            }
+        }
+    }
+
+    /**
+     * Compare the recorded data points with `expect.records` as a multiset; nothing else may be recorded.
+     *
+     * @param  list<array{metric: string, kind: string, value: mixed, attributes: array<string, mixed>}>  $actual
+     * @param  list<array<string, mixed>>  $expected
+     */
+    private function assertMetricRecords(string $name, array $actual, array $expected, ?string $producedQueue): void
+    {
+        $remaining = $actual;
+        foreach ($expected as $record) {
+            $attributes = [];
+            foreach ($record['attributes'] as $key => $value) {
+                if ($value === '$produced.meta.queue') {
+                    if ($producedQueue !== null && trim($producedQueue, " \t\n\x0B\f\r") !== '') {
+                        $attributes[$key] = $producedQueue;
+                    }
+
+                    continue;
+                }
+                $attributes[$key] = $value;
+            }
+            $wantsError = ($record['error_type'] ?? null) === 'present';
+
+            $matched = null;
+            foreach ($remaining as $index => $point) {
+                $pointAttributes = $point['attributes'];
+                if ($wantsError) {
+                    if (! is_string($pointAttributes['error.type'] ?? null) || $pointAttributes['error.type'] === '') {
+                        continue;
+                    }
+                    unset($pointAttributes['error.type']);
+                }
+                ksort($pointAttributes);
+                $want = $attributes;
+                ksort($want);
+                if ($point['metric'] !== $record['metric'] || $point['kind'] !== $record['kind'] || $pointAttributes !== $want) {
+                    continue;
+                }
+                $valueOk = $record['value'] === 'non_negative_seconds'
+                    ? (is_float($point['value']) || is_int($point['value'])) && is_finite((float) $point['value']) && $point['value'] >= 0
+                    : $point['value'] === $record['value'];
+                if ($valueOk) {
+                    $matched = $index;
+
+                    break;
+                }
+            }
+            self::assertNotNull($matched, $name . ': expected a data point ' . json_encode($record) . ', got ' . json_encode($actual));
+            unset($remaining[$matched]);
+        }
+        self::assertSame([], array_values($remaining), $name . ': nothing else may be recorded');
+    }
+
+    /**
+     * @return array{0: ExportingReader, 1: ArrayObject<int, Metric>, 2: MeterInterface}
+     */
+    private function metricHarness(): array
+    {
+        /** @var ArrayObject<int, Metric> $storage */
+        $storage = new ArrayObject();
+        $reader = new ExportingReader(new MetricMemoryExporter($storage));
+        $meter = MeterProvider::builder()->addReader($reader)->build()->getMeter('conformance', null, Tracing::SCHEMA_URL);
+
+        return [$reader, $storage, $meter];
+    }
+
+    /**
+     * @param  ArrayObject<int, Metric>  $storage
+     * @return list<array{metric: string, kind: string, value: mixed, attributes: array<string, mixed>}>
+     */
+    private function collectMetricRecords(ExportingReader $reader, ArrayObject $storage): array
+    {
+        $reader->collect();
+        $records = [];
+        foreach ($storage as $metric) {
+            $data = $metric->data;
+            if ($data instanceof Sum) {
+                foreach ($data->dataPoints as $point) {
+                    $records[] = ['metric' => $metric->name, 'kind' => 'add', 'value' => $point->value, 'attributes' => $point->attributes->toArray()];
+                }
+            } elseif ($data instanceof Histogram) {
+                foreach ($data->dataPoints as $point) {
+                    // One observation per scenario: the sum of a count-1 histogram point is the observation.
+                    self::assertSame(1, $point->count, $metric->name . ': one observation per scenario');
+                    $records[] = ['metric' => $metric->name, 'kind' => 'record', 'value' => $point->sum, 'attributes' => $point->attributes->toArray()];
+                }
+            }
+        }
+
+        return $records;
     }
 
     /**
@@ -1134,5 +1642,28 @@ final class BehaviourConformanceTest extends TestCase
         }
 
         return $a === $b;
+    }
+}
+
+/**
+ * A {@see \BabelQueue\Contracts\Transport} for the `otel` conformance runners: it keeps the envelope it was handed
+ * (also when the publish then fails) and fails on demand.
+ */
+final class ConformanceSpanTransport implements \BabelQueue\Contracts\Transport
+{
+    public ?string $payload = null;
+
+    public function __construct(private readonly bool $fail = false)
+    {
+    }
+
+    public function publish(string $payload, ?string $queue = null): ?string
+    {
+        $this->payload = $payload;
+        if ($this->fail) {
+            throw new \RuntimeException('transport down');
+        }
+
+        return null;
     }
 }

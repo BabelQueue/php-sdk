@@ -10,6 +10,11 @@ use BabelQueue\Contracts\HasHeaders;
 use BabelQueue\Contracts\HeaderPublisher;
 use BabelQueue\Contracts\Transport;
 use BabelQueue\Otel\Tracing;
+use BabelQueue\Transport\KafkaMessage;
+use BabelQueue\Transport\KafkaProducer;
+use BabelQueue\Transport\KafkaTransport;
+use BabelQueue\Transport\StompClient;
+use BabelQueue\Transport\StompTransport;
 use OpenTelemetry\API\Trace\Span;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
@@ -21,6 +26,7 @@ use OpenTelemetry\SDK\Trace\SpanProcessor\SimpleSpanProcessor;
 use OpenTelemetry\SDK\Trace\TracerProvider;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
 use RuntimeException;
 
 /**
@@ -90,7 +96,8 @@ final class TracingTest extends TestCase
 
         self::assertTrue($called);
         $span = $this->firstSpan();
-        self::assertSame('process urn:babel:orders:created', $span->getName());
+        // ADR-0038: the span name carries the queue, never the URN (which moves to babelqueue.urn).
+        self::assertSame('process orders', $span->getName());
         self::assertSame(SpanKind::KIND_CONSUMER, $span->getKind());
         self::assertSame(Tracing::traceIdOf(self::TRACE_ID), $span->getContext()->getTraceId());
 
@@ -99,6 +106,7 @@ final class TracingTest extends TestCase
         self::assertSame(self::TRACE_ID, $attributes['messaging.message.conversation_id']);
         self::assertSame('orders', $attributes['messaging.destination.name']);
         self::assertSame('m1', $attributes['messaging.message.id']);
+        self::assertSame('urn:babel:orders:created', $attributes['babelqueue.urn']);
     }
 
     public function test_wrap_records_handler_error_and_rethrows(): void
@@ -290,6 +298,307 @@ final class TracingTest extends TestCase
         );
     }
 
+    // -- ADR-0038: span shape ----------------------------------------------------------------------
+
+    public function test_semconv_pin_is_exposed(): void
+    {
+        self::assertSame('1.44.0', Tracing::SEMCONV_VERSION);
+        self::assertSame('https://opentelemetry.io/schemas/1.44.0', Tracing::SCHEMA_URL);
+    }
+
+    public function test_consumer_span_carries_the_adr_0038_attribute_set_and_the_transition_keys(): void
+    {
+        $handler = Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {}, system: 'kafka', consumerGroup: 'billing');
+        $handler($this->message());
+
+        $span = $this->firstSpan();
+        self::assertSame('process orders', $span->getName());
+        self::assertAttributes(
+            [
+                'messaging.system' => 'kafka',
+                'messaging.operation.type' => 'process',
+                'messaging.operation.name' => 'process',
+                'messaging.message.conversation_id' => self::TRACE_ID,
+                'babelqueue.urn' => 'urn:babel:orders:created',
+                'babelqueue.schema_version' => 1,
+                'babelqueue.attempts' => 0,
+                'messaging.babelqueue.attempts' => 0,
+                'messaging.operation' => 'process',
+                'messaging.destination.name' => 'orders',
+                'messaging.message.id' => 'm1',
+                'messaging.consumer.group.name' => 'billing',
+            ],
+            $span->getAttributes()->toArray(),
+        );
+    }
+
+    public function test_consumer_without_options_keeps_the_deprecated_default_system_and_writes_no_group(): void
+    {
+        Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {}, system: '')($this->message());
+
+        $attributes = $this->firstSpan()->getAttributes()->toArray();
+        self::assertSame('babelqueue', $attributes['messaging.system']);
+        self::assertArrayNotHasKey('messaging.consumer.group.name', $attributes);
+    }
+
+    public function test_consumer_span_without_a_queue_is_the_bare_operation_and_has_no_destination(): void
+    {
+        $message = new OtelFakeMessage([
+            'job' => 'urn:babel:orders:created',
+            'trace_id' => self::TRACE_ID,
+            'data' => [],
+            'meta' => ['id' => 'm1', 'queue' => " \t ", 'schema_version' => 1],
+            'attempts' => 2,
+        ]);
+
+        Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {})($message);
+
+        $span = $this->firstSpan();
+        self::assertSame('process', $span->getName());
+        $attributes = $span->getAttributes()->toArray();
+        self::assertArrayNotHasKey('messaging.destination.name', $attributes);
+        self::assertSame('urn:babel:orders:created', $attributes['babelqueue.urn']);
+        self::assertSame(2, $attributes['babelqueue.attempts']);
+    }
+
+    public function test_consumer_failure_sets_error_type_status_and_rethrows_unchanged(): void
+    {
+        $boom = new RuntimeException('boom');
+        $handler = Tracing::wrap($this->tracer, static function (ConsumedMessage $message) use ($boom): void {
+            throw $boom;
+        });
+
+        try {
+            $handler($this->message());
+            self::fail('expected the handler error');
+        } catch (RuntimeException $e) {
+            self::assertSame($boom, $e);
+        }
+
+        $span = $this->firstSpan();
+        self::assertSame(StatusCode::STATUS_ERROR, $span->getStatus()->getCode());
+        self::assertSame('boom', $span->getStatus()->getDescription());
+        self::assertSame(RuntimeException::class, $span->getAttributes()->toArray()['error.type']);
+        self::assertSame('exception', $span->getEvents()[0]->getName());
+    }
+
+    public function test_a_successful_span_has_no_error_type(): void
+    {
+        Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {})($this->message());
+
+        self::assertArrayNotHasKey('error.type', $this->firstSpan()->getAttributes()->toArray());
+        self::assertSame(StatusCode::STATUS_UNSET, $this->firstSpan()->getStatus()->getCode());
+    }
+
+    public function test_producer_span_is_send_queue_with_the_adr_0038_attribute_set(): void
+    {
+        $transport = new RecordingTransport();
+
+        Tracing::publish($this->tracer, $transport, 'urn:babel:orders:created', ['order_id' => 7], 'orders', system: 'rabbitmq');
+
+        self::assertNotNull($transport->lastPayload);
+        $envelope = json_decode($transport->lastPayload, true);
+        self::assertIsArray($envelope);
+        self::assertIsArray($envelope['meta'] ?? null);
+
+        $span = $this->firstSpan();
+        self::assertSame('send orders', $span->getName());
+        self::assertSame(SpanKind::KIND_PRODUCER, $span->getKind());
+        self::assertAttributes(
+            [
+                'messaging.system' => 'rabbitmq',
+                'messaging.operation.type' => 'send',
+                'messaging.operation.name' => 'send',
+                'babelqueue.urn' => 'urn:babel:orders:created',
+                'babelqueue.schema_version' => 1,
+                'messaging.operation' => 'publish',
+                'messaging.destination.name' => 'orders',
+                'messaging.message.id' => $envelope['meta']['id'],
+                'messaging.message.conversation_id' => $envelope['trace_id'],
+            ],
+            $span->getAttributes()->toArray(),
+        );
+    }
+
+    public function test_producer_span_with_a_blank_queue_is_the_bare_send_without_destination(): void
+    {
+        Tracing::publish($this->tracer, new RecordingTransport(), 'urn:babel:orders:created', [], '  ');
+
+        $span = $this->firstSpan();
+        self::assertSame('send', $span->getName());
+        self::assertArrayNotHasKey('messaging.destination.name', $span->getAttributes()->toArray());
+    }
+
+    public function test_producer_failure_after_the_envelope_is_built_keeps_the_message_identity_and_sets_error_type(): void
+    {
+        $transport = new class implements Transport {
+            public function publish(string $payload, ?string $queue = null): ?string
+            {
+                throw new RuntimeException('transport down');
+            }
+        };
+
+        try {
+            Tracing::publish($this->tracer, $transport, 'urn:babel:orders:created', [], 'orders');
+            self::fail('expected a RuntimeException');
+        } catch (RuntimeException) {
+        }
+
+        $attributes = $this->firstSpan()->getAttributes()->toArray();
+        self::assertSame(RuntimeException::class, $attributes['error.type']);
+        self::assertNotSame('', $attributes['messaging.message.id'] ?? '');
+        self::assertNotSame('', $attributes['messaging.message.conversation_id'] ?? '');
+    }
+
+    public function test_producer_failure_before_the_envelope_is_built_has_no_message_identity(): void
+    {
+        $transport = new RecordingTransport();
+
+        try {
+            // Invalid UTF-8 in the data: encoding fails, so no envelope ever reaches the transport.
+            Tracing::publish($this->tracer, $transport, 'urn:babel:orders:created', ['bad' => "\xB1"], 'orders');
+            self::fail('expected the encode to fail');
+        } catch (\JsonException) {
+        }
+
+        self::assertNull($transport->lastPayload);
+        $attributes = $this->firstSpan()->getAttributes()->toArray();
+        self::assertArrayNotHasKey('messaging.message.id', $attributes);
+        self::assertArrayNotHasKey('messaging.message.conversation_id', $attributes);
+        self::assertSame(\JsonException::class, $attributes['error.type']);
+    }
+
+    // -- ADR-0038 section 7: the non-UUID trace_id mapping -----------------------------------------
+
+    public function test_a_uuid_with_a_trailing_newline_is_hashed_not_decoded(): void
+    {
+        // PCRE `$` matches before a trailing "\n"; the mapping is anchored with `\z`, like the other five SDKs.
+        self::assertSame('4e72d2e2f40df8529256d33c375dfe8c', Tracing::traceIdOf(self::TRACE_ID . "\n"));
+        self::assertSame('2092f9b3cbf4e482796b67febc62c85e', Tracing::traceIdOf(str_replace('-', '', self::TRACE_ID) . "\n"));
+        self::assertSame(str_replace('-', '', self::TRACE_ID), Tracing::traceIdOf(self::TRACE_ID));
+    }
+
+    public function test_hashing_a_non_uuid_warns_once_per_distinct_value_when_a_logger_is_given(): void
+    {
+        $logger = new RecordingLogger();
+        $value = 'order-' . bin2hex(random_bytes(6));
+
+        Tracing::traceIdOf($value, $logger);
+        Tracing::traceIdOf($value, $logger);
+        Tracing::traceIdOf(self::TRACE_ID, $logger); // a UUID is not hashed: no warning
+        Tracing::traceIdOf($value . 'x', $logger);
+
+        self::assertCount(2, $logger->warnings);
+        self::assertSame($value, $logger->warnings[0]['trace_id']);
+        // Without a logger it is silent and still deterministic.
+        self::assertSame(Tracing::traceIdOf($value), Tracing::traceIdOf($value));
+    }
+
+    public function test_wrap_warns_through_the_logger_for_a_non_uuid_trace_id_and_forwards_it_unchanged(): void
+    {
+        $logger = new RecordingLogger();
+        $traceId = 'req/' . bin2hex(random_bytes(6));
+        $message = new OtelFakeMessage([
+            'job' => 'urn:babel:orders:created',
+            'trace_id' => $traceId,
+            'data' => [],
+            'meta' => ['id' => 'm1', 'queue' => 'orders', 'schema_version' => 1],
+            'attempts' => 0,
+        ]);
+
+        Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {}, logger: $logger)($message);
+
+        self::assertCount(1, $logger->warnings);
+        $span = $this->firstSpan();
+        self::assertSame($traceId, $span->getAttributes()->toArray()['messaging.message.conversation_id']);
+        self::assertSame(Tracing::traceIdOf($traceId), $span->getContext()->getTraceId());
+    }
+
+    // -- ADR-0028 finer W3C validity: upper-case hex is ignored ------------------------------------
+
+    public function test_remote_parent_from_headers_ignores_an_upper_case_flags_field(): void
+    {
+        $header = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0A';
+
+        // The open-telemetry/api propagator alone accepts this header; the structure check rejects it.
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => $header]));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => strtoupper($header)]));
+        self::assertNotNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0a']));
+    }
+
+    public function test_remote_parent_from_headers_rejects_a_trailing_newline_and_invalid_ids(): void
+    {
+        $valid = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+
+        self::assertNotNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => $valid]));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => $valid . "\n"]));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => 'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01']));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => '00-00000000000000000000000000000000-00f067aa0ba902b7-01']));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01']));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => '00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01']));
+        self::assertNull(Tracing::remoteParentFromHeaders([Tracing::HEADER_TRACEPARENT => '00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01']));
+    }
+
+    // -- R1-O3: traceparent rides the Kafka and STOMP producers end to end -------------------------
+
+    public function test_publish_through_the_kafka_transport_propagates_a_traceparent_that_wrap_picks_up(): void
+    {
+        $producer = new CapturingKafkaProducer();
+
+        Tracing::publish($this->tracer, new KafkaTransport($producer), 'urn:babel:orders:created', ['order_id' => 7], 'orders', system: 'kafka');
+        $producerSpan = $this->firstSpan();
+
+        self::assertNotNull($producer->payload);
+        self::assertArrayHasKey('traceparent', $producer->headers);
+        self::assertSame(
+            sprintf('00-%s-%s-01', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId()),
+            $producer->headers['traceparent'],
+        );
+        self::assertStringNotContainsString('traceparent', $producer->payload);
+        self::assertSame('urn:babel:orders:created', $producer->headers['bq-job']);
+
+        // The consume side: the record headers reach wrap() through KafkaMessage (HasHeaders).
+        $envelope = json_decode($producer->payload, true);
+        self::assertIsArray($envelope);
+        $received = new KafkaMessage($envelope, $producer->headers, $producer->payload, null, null, 'orders');
+        Tracing::wrap($this->tracer, static function (ConsumedMessage $message): void {}, system: 'kafka', consumerGroup: 'billing')($received);
+
+        $consumer = $this->lastSpan();
+        self::assertSame('process orders', $consumer->getName());
+        self::assertSame($producerSpan->getContext()->getSpanId(), $consumer->getParentContext()->getSpanId());
+        self::assertTrue($consumer->getParentContext()->isRemote());
+    }
+
+    public function test_publish_through_the_stomp_transport_propagates_a_traceparent_header(): void
+    {
+        $client = new CapturingStompClient();
+
+        Tracing::publish($this->tracer, new StompTransport($client), 'urn:babel:orders:created', ['order_id' => 7], 'orders', system: 'activemq');
+        $producerSpan = $this->firstSpan();
+
+        self::assertSame('orders', $client->destination);
+        self::assertSame(
+            sprintf('00-%s-%s-01', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId()),
+            $client->headers['traceparent'] ?? null,
+        );
+        self::assertNotNull($client->body);
+        self::assertStringNotContainsString('traceparent', $client->body);
+        self::assertSame('babelqueue', $client->headers['bq_app_id']);
+    }
+
+    /**
+     * Same keys and the same typed values, in any order.
+     *
+     * @param  array<string, mixed>  $expected
+     * @param  array<string, mixed>  $actual
+     */
+    private static function assertAttributes(array $expected, array $actual): void
+    {
+        ksort($expected);
+        ksort($actual);
+        self::assertSame($expected, $actual);
+    }
+
     private function firstSpan(): ImmutableSpan
     {
         $span = $this->storage[0] ?? null;
@@ -366,6 +675,59 @@ final class RecordingHeaderTransport implements HeaderPublisher
         $this->lastHeaders = $headers;
 
         return 'hdr-1';
+    }
+}
+
+/**
+ * A PSR-3 logger that keeps the warnings (message and context) it was given.
+ */
+final class RecordingLogger extends AbstractLogger
+{
+    /** @var list<array<string, mixed>> the context of every warning */
+    public array $warnings = [];
+
+    public function log($level, string|\Stringable $message, array $context = []): void
+    {
+        if ($level === 'warning') {
+            $this->warnings[] = $context;
+        }
+    }
+}
+
+/**
+ * A {@see KafkaProducer} that remembers the last record it was given.
+ */
+final class CapturingKafkaProducer implements KafkaProducer
+{
+    public ?string $payload = null;
+
+    /** @var array<string, string> */
+    public array $headers = [];
+
+    public function produce(string $topic, string $payload, array $headers, ?int $timestampMs = null): void
+    {
+        $this->payload = $payload;
+        $this->headers = $headers;
+    }
+}
+
+/**
+ * A {@see StompClient} that remembers the last frame it was given.
+ */
+final class CapturingStompClient implements StompClient
+{
+    public ?string $destination = null;
+
+    public ?string $body = null;
+
+    /** @var array<string, string> */
+    public array $headers = [];
+
+    public function send(string $destination, string $body, array $headers): void
+    {
+        $this->destination = $destination;
+        $this->body = $body;
+        $this->headers = $headers;
     }
 }
 

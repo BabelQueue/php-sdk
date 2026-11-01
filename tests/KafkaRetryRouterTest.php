@@ -277,4 +277,78 @@ final class KafkaRetryRouterTest extends TestCase
 
         $this->assertSame([['orders.retry.1', '5000'], ['orders.retry.2', '30000']], $seen);
     }
+
+    /**
+     * Regression (R1-O3): a retry hop keeps the inbound W3C trace headers so the retried delivery stays a child of
+     * the producer span; nothing else is copied from the inbound record (`bq-*` come from the body).
+     */
+    public function test_a_retry_keeps_traceparent_and_tracestate_and_copies_no_other_inbound_header(): void
+    {
+        $tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        $captured = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->with(
+            'orders.retry.1',
+            Mockery::any(),
+            Mockery::on(function (array $headers) use (&$captured): bool {
+                $captured = $headers;
+
+                return true;
+            }),
+            Mockery::any(),
+        );
+
+        (new KafkaRetryRouter($producer))->route($this->message([], [
+            'traceparent' => $tp, 'tracestate' => 'vendor=1', 'x-app' => 'a', 'bq-attempts' => '7',
+        ]));
+
+        $this->assertSame($tp, $captured['traceparent']);
+        $this->assertSame('vendor=1', $captured['tracestate']);
+        $this->assertArrayNotHasKey('x-app', $captured);
+        $this->assertSame('1', $captured['bq-attempts']); // from the body, not the inbound header
+    }
+
+    public function test_a_requested_delay_keeps_the_trace_headers_too(): void
+    {
+        $tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        $captured = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->with(
+            'orders.retry.1',
+            Mockery::any(),
+            Mockery::on(function (array $headers) use (&$captured): bool {
+                $captured = $headers;
+
+                return true;
+            }),
+            Mockery::any(),
+        );
+
+        (new KafkaRetryRouter($producer))->route($this->message([], ['traceparent' => $tp]), null, 1000);
+
+        $this->assertSame($tp, $captured['traceparent']);
+        $this->assertArrayNotHasKey('tracestate', $captured);
+        $this->assertSame('1000', $captured['bq-delay']);
+    }
+
+    public function test_a_retry_without_inbound_trace_headers_adds_none(): void
+    {
+        $captured = [];
+        $producer = Mockery::mock(KafkaProducer::class);
+        $producer->shouldReceive('produce')->once()->with(
+            'orders.retry.1',
+            Mockery::any(),
+            Mockery::on(function (array $headers) use (&$captured): bool {
+                $captured = $headers;
+
+                return true;
+            }),
+            Mockery::any(),
+        );
+
+        (new KafkaRetryRouter($producer))->route($this->message());
+
+        $this->assertArrayNotHasKey('traceparent', $captured);
+        $this->assertArrayNotHasKey('tracestate', $captured);
+    }
 }

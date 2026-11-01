@@ -9,6 +9,82 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.28.0] - 2026-11-01
+
+Implements ADR-0038 (OpenTelemetry semantic-conventions alignment) and ADR-0039 (standard metrics and the
+dead-letter observer) for the PHP `Otel` module, and makes `KafkaTransport` and `StompTransport` carry a W3C
+`traceparent` (R1-O3). Runs against conformance v1.9.0 (sections `span-shape`, `trace-id` and `metrics`, plus six
+new `traceparent` cases). The envelope stays at `schema_version: 1`; nothing on the wire changes. This is a
+**MINOR**.
+
+### Changed (dashboard-breaking, ADR-0038 section 5)
+- **Span names.** `Tracing::publish()` now emits `send <queue>` (was `publish <urn>`) and `Tracing::wrap()` emits
+  `process <queue>` (was `process <urn>`). With no queue (blank) the name is the bare `send` / `process`. The URN is
+  no longer in the span name; it is the `babelqueue.urn` attribute.
+- **Producer destination.** `messaging.destination.name` on a producer span is the queue (was the URN), so a producer
+  span and its consumer span share a destination.
+- **`messaging.system`** is the value of the new `system:` argument (`'kafka'`, `'rabbitmq'`, `'aws_sqs'`, `'servicebus'`,
+  `'pulsar'`, `'redis'`, `'activemq'`; any other value is written as given). Without it the value stays `babelqueue`.
+- **New attributes.** `messaging.operation.type` and `messaging.operation.name` (`send` / `process`),
+  `babelqueue.urn`, `babelqueue.schema_version`, `babelqueue.attempts`, `messaging.consumer.group.name` (only when
+  `consumerGroup:` is given) and `error.type` (the class name of the error, on a failed publish or handler, next to the
+  recorded exception and the error status). The producer now sets `messaging.message.id` and
+  `messaging.message.conversation_id` as soon as the envelope is built, so a failed publish keeps them.
+
+### Deprecated
+- **Not passing `system:`.** The default `messaging.system = babelqueue` is deprecated; pass the broker name.
+- **`messaging.operation` and `messaging.babelqueue.attempts`** are still written, next to their replacements, for
+  this MINOR only. **The next MINOR removes both.**
+
+### Added
+- `Tracing::wrap()` and `Tracing::publish()` take the optional named arguments `system:` and `meter:`; `wrap()` also
+  takes `consumerGroup:` and `logger:` (PSR-3). Existing calls are unchanged.
+- `Tracing::SEMCONV_VERSION` (`1.44.0`) and `Tracing::SCHEMA_URL` (`https://opentelemetry.io/schemas/1.44.0`): create
+  the tracer or meter with the schema URL to pin the semantic-conventions release.
+- `BabelQueue\Otel\Metrics` (ADR-0039): `messaging.process.duration` (histogram, `s`), `messaging.client.sent.messages`,
+  `messaging.client.consumed.messages`, `babelqueue.retries` and `babelqueue.dlq.messages` (counters, `{message}`),
+  recorded through an `open-telemetry/api` `MeterInterface` (still a `suggest` dependency). `Tracing::wrap()` /
+  `Tracing::publish()` record them when given a `meter:`; with none nothing is recorded. Attributes are
+  `messaging.system`, `messaging.operation.name`, `messaging.destination.name` (when the queue is known) and
+  `error.type` (on failure) only; no URN, id, `trace_id`, attempts or dead-letter reason.
+- `BabelQueue\Contracts\DeadLetterObserver` (no OpenTelemetry import): told once per dead-letter record the SDK wrote,
+  after the write was confirmed, with the source queue (`meta.queue`, without the topic prefix), the DLQ and the reason. Optional `observer` constructor
+  argument on `Consume\DeadLetterPublisher` (`publish` and `publishRaw`), `Transport\KafkaRetryRouter` (attempts
+  exhausted) and `Transport\KafkaConsumer` (poison record). A failed write never calls it, and an observer that
+  throws is logged with `error_log` and ignored, so it cannot change the settle outcome. `Metrics` implements it:
+  `new DeadLetterPublisher($transport, observer: new Metrics($meter, 'kafka'))` counts `babelqueue.dlq.messages`.
+- `KafkaTransport` and `StompTransport` implement `HeaderPublisher`: `publishWithHeaders()` writes the headers as
+  Kafka record headers / STOMP custom headers beside the `bq-` / `bq_` projection (which wins a key collision), never
+  inside the envelope. `Tracing::publish()` now propagates a `traceparent` over both, so a consumer starts its span as a
+  true child. Artemis bridges the STOMP header to an AMQP 1.0 application-property and a JMS string property.
+- `KafkaTransport::publishWithHeaders()` never takes the eight reserved `bq-` contract headers (`bq-job`, `bq-trace-id`,
+  `bq-message-id`, `bq-schema-version`, `bq-source-lang`, `bq-attempts`, `bq-delay`, `bq-original-topic`) from the
+  carrier, so a rider cannot redirect a record's retry chain; `StompTransport::publishWithHeaders()` drops the `bq_*`
+  family and the frame-level headers (`destination`, `content-length`, `content-type`, `correlation-id`, `receipt`,
+  `transaction`, `_AMQ_SCHED_DELIVERY`, `JMSType`).
+- `Metrics::shared()`: the static `Tracing::publish()` path creates the instruments once per meter and system.
+- `Tracing::traceIdOf()` takes an optional PSR-3 `LoggerInterface` and warns, once per distinct value, when it hashes a
+  non-UUID `trace_id` (the value itself is still preserved and forwarded unchanged).
+- Tests: `tests/Otel/MetricsTest.php`, `tests/DeadLetterObserverTest.php` (all three write paths, against fake
+  producers, so no `ext-rdkafka`), the `span-shape`, `trace-id` and `metrics` runners in
+  `tests/BehaviourConformanceTest.php`.
+
+### Fixed
+- **`Tracing::traceIdOf()` hashed differently from the other SDKs for a UUID with a trailing newline.** The PCRE `$`
+  also matches before a final `\n`, so `"<uuid>\n"` was decoded as a UUID; the match is now anchored with `\z`, so it is
+  hashed like the other five SDKs (GR-5). Pinned by the `trace-id` cases `uuid-with-trailing-newline-is-hashed` and
+  `uuid-without-hyphens-with-trailing-newline-is-hashed`.
+- **`Tracing::remoteParentFromHeaders()` accepted an upper-case `traceparent` flags field** (`...-0A`) because the
+  `open-telemetry/api` 1.10 propagator only checks `ctype_xdigit`. The header is now checked against the lower-case W3C
+  structure first (`\A...\z`), so such a header, and one with a trailing newline, is ignored and the consumer falls back
+  to the `trace_id`-derived parent. Pinned by the `traceparent` case `uppercase-flags-ignored`.
+
+### Compatibility
+- A dependency-light core: `open-telemetry/api` stays a `suggest` / `require-dev` package, and nothing outside
+  `src/Otel/` loads it (`DeadLetterObserver` is a plain interface).
+- `KafkaRetryRouter` copies the inbound `traceparent` / `tracestate` onto the retry and requested-delay records (nothing
+  else from the inbound headers), so a retried delivery stays a child of the producer span, like Go, Java and Python.
+
 ## [1.27.0] - 2026-10-26
 
 Implements ADR-0037 decision 1 (the version-gate settle rule, Pulsar §5.7) for the PHP core against conformance
