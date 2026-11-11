@@ -180,7 +180,7 @@ final class TracingTest extends TestCase
 
         self::assertArrayHasKey('traceparent', $headers);
         // The injected traceparent encodes the producer span's trace + span id (W3C format).
-        $expected = sprintf('00-%s-%s-01', $span->getContext()->getTraceId(), $span->getContext()->getSpanId());
+        $expected = sprintf('00-%s-%s-%02x', $span->getContext()->getTraceId(), $span->getContext()->getSpanId(), $span->getContext()->getTraceFlags());
         self::assertSame($expected, $headers['traceparent']);
 
         // Extracting it back yields a valid remote parent in the same trace.
@@ -269,7 +269,7 @@ final class TracingTest extends TestCase
 
         // The transport received the header path with a W3C traceparent encoding the producer span.
         self::assertNotNull($transport->lastHeaders);
-        $expected = sprintf('00-%s-%s-01', $span->getContext()->getTraceId(), $span->getContext()->getSpanId());
+        $expected = sprintf('00-%s-%s-%02x', $span->getContext()->getTraceId(), $span->getContext()->getSpanId(), $span->getContext()->getTraceFlags());
         self::assertSame($expected, $transport->lastHeaders['traceparent'] ?? null);
 
         // GR-1 / GR-4: the body is the frozen envelope and still stamps trace_id (belt-and-braces).
@@ -551,7 +551,7 @@ final class TracingTest extends TestCase
         self::assertNotNull($producer->payload);
         self::assertArrayHasKey('traceparent', $producer->headers);
         self::assertSame(
-            sprintf('00-%s-%s-01', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId()),
+            sprintf('00-%s-%s-%02x', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId(), $producerSpan->getContext()->getTraceFlags()),
             $producer->headers['traceparent'],
         );
         self::assertStringNotContainsString('traceparent', $producer->payload);
@@ -578,7 +578,7 @@ final class TracingTest extends TestCase
 
         self::assertSame('orders', $client->destination);
         self::assertSame(
-            sprintf('00-%s-%s-01', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId()),
+            sprintf('00-%s-%s-%02x', $producerSpan->getContext()->getTraceId(), $producerSpan->getContext()->getSpanId(), $producerSpan->getContext()->getTraceFlags()),
             $client->headers['traceparent'] ?? null,
         );
         self::assertNotNull($client->body);
