@@ -15,6 +15,9 @@ use RuntimeException;
  * cached. A URN that is not in the manifest returns null (skip validation); a URN whose
  * schema file is missing or unreadable throws (a configuration/IO error → the consumer
  * redelivers until it is fixed). The PHP mirror of the Go `schema.DirProvider`.
+ *
+ * Each schema's unsupported keywords are reported once, when its file is first loaded
+ * ({@see KeywordWarnings}); {@see warnings()} returns what was reported so far.
  */
 final class DirProvider implements SchemaProvider
 {
@@ -26,8 +29,19 @@ final class DirProvider implements SchemaProvider
     /** @var array<string, array<string, mixed>> lazily-decoded schema cache */
     private array $cache = [];
 
-    public function __construct(string $manifestPath)
+    /** @var array<string, list<array{pointer: string, keyword: string}>> urn => warnings reported when the schema was first loaded */
+    private array $warnings = [];
+
+    /** @var (callable(string, string): void)|null */
+    private $onWarning;
+
+    /**
+     * @param  (callable(string, string): void)|null  $onWarning  fn(string $message, string $pointer); defaults to error_log()
+     */
+    public function __construct(string $manifestPath, ?callable $onWarning = null)
     {
+        $this->onWarning = $onWarning;
+
         $raw = @file_get_contents($manifestPath);
         if ($raw === false) {
             throw new RuntimeException("schema: cannot read registry manifest [{$manifestPath}].");
@@ -77,7 +91,23 @@ final class DirProvider implements SchemaProvider
         /** @var array<string, mixed> $decoded */
         $this->cache[$urn] = $decoded;
 
+        $found = KeywordWarnings::report($urn, $decoded, $this->onWarning);
+        if ($found !== []) {
+            $this->warnings[$urn] = $found;
+        }
+
         return $decoded;
+    }
+
+    /**
+     * The unsupported-keyword warnings reported so far (schemas are loaded lazily, so a URN appears
+     * after its first {@see schemaFor()}): `urn => list<['pointer' => ..., 'keyword' => ...]>`.
+     *
+     * @return array<string, list<array{pointer: string, keyword: string}>>
+     */
+    public function warnings(): array
+    {
+        return $this->warnings;
     }
 
     private static function isAbsolute(string $path): bool

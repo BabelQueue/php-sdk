@@ -265,6 +265,17 @@ final class EnvelopeCodec
     }
 
     /**
+     * The process-wide warning sink installed by {@see setWarningHandler()}, or null when none is
+     * set. Read-only: lets other components (e.g. the schema providers) honour the same sink.
+     *
+     * @return (callable(string, string): void)|null
+     */
+    public static function warningHandler(): ?callable
+    {
+        return self::$warningHandler;
+    }
+
+    /**
      * The message URN: canonical "job", with "urn" accepted as an inbound alias when
      * "job" is missing or blank (empty / ASCII whitespace only). Returns '' when neither
      * yields a non-blank string.
