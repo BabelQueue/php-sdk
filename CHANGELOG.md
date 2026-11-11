@@ -9,6 +9,32 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Brings the opt-in payload validator (ADR-0024) to the K-17 Draft-07 subset behaviour pinned by conformance
+v1.10.0 (section `payload_schema_keywords`). Only the optional `data` validation changes; the envelope stays at
+`schema_version: 1` and nothing on the wire changes.
+
+### Added
+- `type` may be a **union list** (`["string", "null"]`): a value is valid when it matches any listed type, and the
+  keywords of the matched type then apply. `integer` accepts every integral number (`1.0`).
+- `maxLength` (Unicode code points, like `minLength`).
+- **Registration warnings for unsupported keywords.** `MapProvider` and `DirProvider` report one warning per keyword
+  outside the subset (`pattern`, `format`, `allOf`, `$ref`, `maximum`, ...) when a schema is first processed
+  (`MapProvider` at construction, `DirProvider` when the file is first loaded). The sink is an optional
+  `fn(string $message, string $pointer)` constructor argument (the codec's warning-sink shape); without one the
+  process-wide `EnvelopeCodec::setWarningHandler()` handler is used, then `error_log()`; `warnings()` returns what was reported as `['pointer' => ..., 'keyword' => ...]` entries.
+  The verdict is unchanged (the keyword is evaluated as absent). Annotation keywords (`$schema`, `$id`, `title`,
+  `description`, `examples`, `default`, `$comment`, `x-*`) never warn. `PayloadValidator::unsupportedKeywords()` is
+  the pure helper.
+
+- `EnvelopeCodec::warningHandler()`: read-only getter for the handler installed with `setWarningHandler()` (additive;
+  codec behaviour and the wire are unchanged).
+
+### Changed
+- **`const` / `enum` compare numbers by mathematical value**, recursively inside arrays and objects: `1`, `1.0` and
+  `1e0` are equal, while `true` is never `1` and `"1"` is never `1`. Before, the comparison was strict (`const: 1`
+  rejected `1.0`).
+- Vendored conformance suite updated to v1.10.0.
+
 ## [1.28.0] - 2026-11-01
 
 Implements ADR-0038 (OpenTelemetry semantic-conventions alignment) and ADR-0039 (standard metrics and the
