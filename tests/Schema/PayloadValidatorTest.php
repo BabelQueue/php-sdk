@@ -117,6 +117,30 @@ final class PayloadValidatorTest extends TestCase
         self::assertNotNull(PayloadValidator::check(['type' => ['nope', 'string']], 1));
     }
 
+    public function test_non_finite_length_bounds_are_ignored(): void
+    {
+        // A NaN / INF bound never changes a verdict (a raw (int) cast would make it 0 and reject "a").
+        foreach (['minLength', 'maxLength'] as $keyword) {
+            foreach ([NAN, INF, -INF] as $bound) {
+                $schema = ['type' => 'string', $keyword => $bound];
+                foreach (['', 'a', 'abc'] as $text) {
+                    self::assertNull(PayloadValidator::check($schema, $text), $keyword . ' ' . var_export($bound, true));
+                }
+            }
+        }
+    }
+
+    public function test_fractional_length_bounds_are_truncated_toward_zero(): void
+    {
+        self::assertNull(PayloadValidator::check(['type' => 'string', 'minLength' => 2.5], 'ab'));
+        self::assertNotNull(PayloadValidator::check(['type' => 'string', 'minLength' => 2.5], 'a'));
+        self::assertNull(PayloadValidator::check(['type' => 'string', 'maxLength' => 2.9], 'ab'));
+        self::assertNotNull(PayloadValidator::check(['type' => 'string', 'maxLength' => 2.9], 'abc'));
+        // A negative fractional bound truncates to 0.
+        self::assertNull(PayloadValidator::check(['type' => 'string', 'maxLength' => -0.5], ''));
+        self::assertNotNull(PayloadValidator::check(['type' => 'string', 'maxLength' => -0.5], 'a'));
+    }
+
     public function test_max_length_counts_code_points(): void
     {
         $schema = ['type' => 'string', 'maxLength' => 3];

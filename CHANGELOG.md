@@ -29,6 +29,11 @@ v1.10.0 (section `payload_schema_keywords`). Only the optional `data` validation
 - `EnvelopeCodec::warningHandler()`: read-only getter for the handler installed with `setWarningHandler()` (additive;
   codec behaviour and the wire are unchanged).
 
+### Fixed
+- A non-finite `minLength` / `maxLength` (`NAN`, `INF`; only reachable from a hand-built schema, never from JSON) is
+  ignored. The `(int)` cast used to turn it into `0`, so `maxLength: NAN` rejected every non-empty string (with a PHP
+  warning). Matches the Go, Node, Python, Java and .NET validators.
+
 ### Changed
 - **`const` / `enum` compare numbers by mathematical value**, recursively inside arrays and objects: `1`, `1.0` and
   `1e0` are equal, while `true` is never `1` and `"1"` is never `1`. Before, the comparison was strict (`const: 1`

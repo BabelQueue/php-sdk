@@ -309,6 +309,24 @@ final class PayloadValidator
     }
 
     /**
+     * A `minLength` / `maxLength` bound as an int truncated toward zero, or null when the keyword is
+     * absent, non-numeric or non-finite (NaN / +-INF) — such a bound is ignored, as in the other SDKs
+     * (a raw `(int)` cast would turn NaN / INF into 0 and reject every non-empty string).
+     */
+    private static function lengthBound(mixed $bound): ?int
+    {
+        if (! is_numeric($bound)) {
+            return null;
+        }
+        $number = $bound + 0;
+        if (is_float($number) && ! is_finite($number)) {
+            return null;
+        }
+
+        return (int) $bound;
+    }
+
+    /**
      * @param  array<string, mixed>  $schema
      */
     private static function checkString(array $schema, mixed $value, string $path): ?string
@@ -316,10 +334,12 @@ final class PayloadValidator
         if (! is_string($value)) {
             return self::violation($path, 'not_a_string');
         }
-        if (isset($schema['minLength']) && is_numeric($schema['minLength']) && mb_strlen($value) < (int) $schema['minLength']) {
+        $min = self::lengthBound($schema['minLength'] ?? null);
+        if ($min !== null && mb_strlen($value) < $min) {
             return self::violation($path, 'below_min_length');
         }
-        if (isset($schema['maxLength']) && is_numeric($schema['maxLength']) && mb_strlen($value) > (int) $schema['maxLength']) {
+        $max = self::lengthBound($schema['maxLength'] ?? null);
+        if ($max !== null && mb_strlen($value) > $max) {
             return self::violation($path, 'above_max_length');
         }
 
