@@ -9,6 +9,28 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.30.0] - 2026-11-22
+
+Implements ADR-0040 (open `lang` tag): the producer schema's closed `lang` enum is replaced by the pattern
+`^[a-z][a-z0-9-]*$` on both `meta.lang` and `dead_letter.lang`, so a new SDK (e.g. Rust) can emit its own tag without a
+contract change. Nothing on the wire changes and the envelope stays at `schema_version: 1`; consumers were already
+tolerant of any `lang` value (decode and re-emit are untouched).
+
+### Added
+- `SchemaValidator` supports the Draft-07 `pattern` keyword. A string that does not match is reported as
+  `<path>: pattern` (`SchemaValidator::REASON_PATTERN_MISMATCH`). The pattern is read with JSON Schema / ECMA-262
+  semantics (unanchored search; `^`/`$` inside the pattern are the anchors, and `$` does not match before a trailing
+  newline). A pattern that cannot be compiled is a schema defect and throws a `LogicException` instead of silently
+  accepting or rejecting every value.
+
+### Changed
+- Bundled `message-envelope.schema.json` and the vendored conformance suite are updated to conformance **1.11.0**
+  (`unknown-lang` now passes the producer schema; new `malformed-lang` case). CI and release pin
+  `BQ_CONFORMANCE_VERSION` to `1.11.0`.
+- `SchemaValidator`: `lang: "rust"` (or any well-formed tag) is now valid; `"Rust 1"` is rejected with reason `pattern`
+  rather than `not_in_enum`. Code that matched on `REASON_NOT_IN_ENUM` for `meta.lang` / `dead_letter.lang` must expect
+  `REASON_PATTERN_MISMATCH`.
+
 ## [1.29.0] - 2026-11-11
 
 Brings the opt-in payload validator (ADR-0024) to the K-17 Draft-07 subset behaviour pinned by conformance

@@ -14,7 +14,7 @@ use PHPUnit\Framework\TestCase;
  *
  * Where {@see EnvelopeValidatorTest} covers the lenient consumer gate, this
  * pins the strict wire contract: required `job` (no `urn` alias), the full
- * `meta` block, UUID-shaped ids, the `lang` enum, the `schema_version` const,
+ * `meta` block, UUID-shaped ids, the `lang` tag pattern, the `schema_version` const,
  * and the optional `dead_letter` block — all without a JSON-Schema library.
  */
 final class SchemaValidatorTest extends TestCase
@@ -135,8 +135,8 @@ final class SchemaValidatorTest extends TestCase
         $emptyQueue = self::base();
         $emptyQueue['meta']['queue'] = '';
 
-        $unknownLang = self::base();
-        $unknownLang['meta']['lang'] = 'rust';
+        $malformedLang = self::base();
+        $malformedLang['meta']['lang'] = 'Rust 1';
 
         $wrongSchemaVersion = self::base();
         $wrongSchemaVersion['meta']['schema_version'] = 2;
@@ -168,6 +168,15 @@ final class SchemaValidatorTest extends TestCase
             'attempts' => 3,
         ];
 
+        $malformedDeadLetterLang = self::base();
+        $malformedDeadLetterLang['dead_letter'] = [
+            'reason' => 'failed',
+            'failed_at' => 1749132728000,
+            'original_queue' => 'orders',
+            'attempts' => 3,
+            'lang' => 'Rust 1',
+        ];
+
         return [
             'missing job' => [$missingJob, 'job: ' . SchemaValidator::REASON_MISSING_REQUIRED],
             'empty job' => [$emptyJob, 'job: ' . SchemaValidator::REASON_EMPTY_STRING],
@@ -178,7 +187,8 @@ final class SchemaValidatorTest extends TestCase
             'missing meta.id' => [$missingMetaId, 'meta.id: ' . SchemaValidator::REASON_MISSING_REQUIRED],
             'meta.id not a uuid' => [$metaIdNotUuid, 'meta.id: ' . SchemaValidator::REASON_NOT_UUID],
             'empty meta.queue' => [$emptyQueue, 'meta.queue: ' . SchemaValidator::REASON_EMPTY_STRING],
-            'unknown meta.lang' => [$unknownLang, 'meta.lang: ' . SchemaValidator::REASON_NOT_IN_ENUM],
+            'malformed meta.lang' => [$malformedLang, 'meta.lang: ' . SchemaValidator::REASON_PATTERN_MISMATCH],
+            'malformed dead_letter.lang' => [$malformedDeadLetterLang, 'dead_letter.lang: ' . SchemaValidator::REASON_PATTERN_MISMATCH],
             'wrong schema_version' => [$wrongSchemaVersion, 'meta.schema_version: ' . SchemaValidator::REASON_WRONG_CONST],
             'created_at not an integer' => [$createdAtNotInt, 'meta.created_at: ' . SchemaValidator::REASON_WRONG_TYPE],
             'negative created_at' => [$negativeCreatedAt, 'meta.created_at: ' . SchemaValidator::REASON_BELOW_MINIMUM],
@@ -199,6 +209,192 @@ final class SchemaValidatorTest extends TestCase
         $this->assertFalse(SchemaValidator::isValid($envelope));
     }
 
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function acceptedLangTags(): array
+    {
+        return [
+            'rust (ADR-0040)' => ['rust'],
+            'php' => ['php'],
+            'go' => ['go'],
+            'python' => ['python'],
+            'java' => ['java'],
+            'dotnet' => ['dotnet'],
+            'node' => ['node'],
+            'hyphenated' => ['common-lisp'],
+            'digit after the first letter' => ['k8s'],
+        ];
+    }
+
+    #[DataProvider('acceptedLangTags')]
+    public function test_an_open_but_well_formed_meta_lang_conforms(string $lang): void
+    {
+        $envelope = self::base();
+        $envelope['meta']['lang'] = $lang;
+
+        $this->assertNull(SchemaValidator::check($envelope));
+    }
+
+    #[DataProvider('acceptedLangTags')]
+    public function test_an_open_but_well_formed_dead_letter_lang_conforms(string $lang): void
+    {
+        $envelope = self::base();
+        $envelope['dead_letter'] = [
+            'reason' => 'failed',
+            'failed_at' => 1749132728000,
+            'original_queue' => 'orders',
+            'attempts' => 3,
+            'lang' => $lang,
+        ];
+
+        $this->assertNull(SchemaValidator::check($envelope));
+        $this->assertTrue(SchemaValidator::isValid($envelope));
+    }
+
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function rejectedLangTags(): array
+    {
+        return [
+            'upper case and space' => ['Rust 1'],
+            'empty' => [''],
+            'leading digit' => ['1go'],
+            'leading hyphen' => ['-go'],
+            'upper case' => ['PHP'],
+            'underscore' => ['dot_net'],
+            'trailing newline ($ is not "before a final newline")' => ["rust\n"],
+            'embedded newline' => ["ru\nst"],
+            'non-ASCII letter' => ['rüst'],
+            'invalid UTF-8' => ["rust\xff"],
+        ];
+    }
+
+    #[DataProvider('rejectedLangTags')]
+    public function test_a_malformed_lang_tag_is_a_pattern_violation(string $lang): void
+    {
+        $envelope = self::base();
+        $envelope['meta']['lang'] = $lang;
+
+        $this->assertSame('meta.lang: ' . SchemaValidator::REASON_PATTERN_MISMATCH, SchemaValidator::check($envelope));
+        $this->assertFalse(SchemaValidator::isValid($envelope));
+    }
+
+    public function test_the_unknown_lang_fixture_conforms_and_malformed_lang_does_not(): void
+    {
+        $unknown = $this->fixture('unknown-lang');
+        $malformed = $this->fixture('malformed-lang');
+
+        $this->assertSame('cobol', $unknown['meta']['lang']);
+        $this->assertNull(SchemaValidator::check($unknown));
+        $this->assertSame('meta.lang: ' . SchemaValidator::REASON_PATTERN_MISMATCH, SchemaValidator::check($malformed));
+    }
+
+    /**
+     * The bundled validator must reach the same producer-side verdict as the
+     * conformance manifest: a roundtrip case is producer-schema valid unless it
+     * says `producer_schema_valid: false`.
+     */
+    public function test_every_roundtrip_fixture_gets_the_verdict_the_manifest_declares(): void
+    {
+        /** @var array<string, mixed> $manifest */
+        $manifest = json_decode((string) file_get_contents(__DIR__ . '/conformance/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
+        /** @var list<array<string, mixed>> $cases */
+        $cases = $manifest['roundtrip']['cases'];
+        $this->assertNotEmpty($cases);
+
+        foreach ($cases as $case) {
+            $fixture = json_decode((string) file_get_contents(__DIR__ . '/conformance/' . $case['file']), true, 512, JSON_THROW_ON_ERROR);
+            $this->assertIsArray($fixture);
+
+            $this->assertSame(
+                ($case['producer_schema_valid'] ?? true) === true,
+                SchemaValidator::isValid($fixture),
+                sprintf('roundtrip case "%s": %s', $case['name'], (string) SchemaValidator::check($fixture)),
+            );
+        }
+    }
+
+    public function test_the_bundled_schema_carries_the_lang_pattern_and_no_lang_enum(): void
+    {
+        $schema = SchemaValidator::schema();
+
+        foreach ([$schema['properties']['meta']['properties']['lang'], $schema['properties']['dead_letter']['properties']['lang']] as $lang) {
+            $this->assertSame('^[a-z][a-z0-9-]*$', $lang['pattern']);
+            $this->assertArrayNotHasKey('enum', $lang);
+        }
+    }
+
+    public function test_pattern_is_searched_unanchored_unless_the_pattern_anchors_itself(): void
+    {
+        $this->assertNull($this->checkWithSchema(['type' => 'string', 'pattern' => 'ab'], 'xxabxx'));
+        $this->assertSame('v: ' . SchemaValidator::REASON_PATTERN_MISMATCH, $this->checkWithSchema(['type' => 'string', 'pattern' => '^ab$'], 'xxabxx'));
+        $this->assertNull($this->checkWithSchema(['type' => 'string', 'pattern' => '^ab$'], 'ab'));
+    }
+
+    public function test_a_pattern_containing_the_first_delimiter_candidate_still_works(): void
+    {
+        $this->assertNull($this->checkWithSchema(['type' => 'string', 'pattern' => '^a~b$'], 'a~b'));
+        $this->assertSame('v: ' . SchemaValidator::REASON_PATTERN_MISMATCH, $this->checkWithSchema(['type' => 'string', 'pattern' => '^a/b$'], 'a-b'));
+        $this->assertNull($this->checkWithSchema(['type' => 'string', 'pattern' => '^a/b$'], 'a/b'));
+    }
+
+    public function test_pattern_does_not_apply_to_non_strings(): void
+    {
+        $this->assertSame('v: ' . SchemaValidator::REASON_WRONG_TYPE, $this->checkWithSchema(['type' => 'string', 'pattern' => '^a$'], 5));
+    }
+
+    public function test_an_uncompilable_pattern_is_a_schema_defect_and_throws(): void
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('is not a valid regular expression');
+
+        $this->checkWithSchema(['type' => 'string', 'pattern' => '^[a-z'], 'abc');
+    }
+
+    public function test_a_pattern_that_cannot_be_delimited_is_a_schema_defect_and_throws(): void
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('cannot be delimited');
+
+        $this->checkWithSchema(['type' => 'string', 'pattern' => '~#%@!`;,'], 'abc');
+    }
+
+    /**
+     * Validate `$value` as property `v` against a substitute bundled schema whose
+     * only property is `$node`, restoring the real schema afterwards.
+     *
+     * @param  array<string, mixed>  $node
+     */
+    private function checkWithSchema(array $node, mixed $value): ?string
+    {
+        $schema = ['type' => 'object', 'properties' => ['v' => $node]];
+        $property = new \ReflectionProperty(SchemaValidator::class, 'schema');
+        $previous = $property->getValue();
+        $property->setValue(null, $schema);
+
+        try {
+            return SchemaValidator::check(['v' => $value]);
+        } finally {
+            $property->setValue(null, $previous);
+        }
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function fixture(string $name): array
+    {
+        /** @var array<string, mixed> */
+        return json_decode(
+            (string) file_get_contents(__DIR__ . '/conformance/fixtures/' . $name . '.json'),
+            true,
+            512,
+            JSON_THROW_ON_ERROR,
+        );
+    }
+
     public function test_a_non_object_envelope_is_rejected_at_the_root(): void
     {
         // A list (JSON array) is not a JSON object at the root.
@@ -208,13 +404,13 @@ final class SchemaValidatorTest extends TestCase
     public function test_validate_throws_carrying_the_violation_and_envelope(): void
     {
         $envelope = self::base();
-        $envelope['meta']['lang'] = 'rust';
+        $envelope['meta']['lang'] = 'Rust 1';
 
         try {
             SchemaValidator::validate($envelope);
             $this->fail('Expected an InvalidEnvelopeException.');
         } catch (InvalidEnvelopeException $e) {
-            $this->assertSame('meta.lang: ' . SchemaValidator::REASON_NOT_IN_ENUM, $e->reason());
+            $this->assertSame('meta.lang: ' . SchemaValidator::REASON_PATTERN_MISMATCH, $e->reason());
             $this->assertSame($envelope, $e->envelope());
         }
     }
