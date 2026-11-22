@@ -15,7 +15,7 @@ use BabelQueue\Exceptions\InvalidEnvelopeException;
  * tolerates the `urn` inbound alias and ignores fields it does not need), this
  * answers "does this match the wire contract exactly as a producer must emit
  * it?" — required `job` (no `urn` alias), the full required `meta` block,
- * UUID-shaped ids, the `lang` enum, `schema_version` const, and the optional
+ * UUID-shaped ids, the `lang` tag pattern, `schema_version` const, and the optional
  * `dead_letter` block when present. It is the in-process echo of the schema diff
  * CI runs against the conformance suite, usable by an app at runtime without any
  * network access or a JSON-Schema library.
@@ -26,8 +26,15 @@ use BabelQueue\Exceptions\InvalidEnvelopeException;
  *
  * Kept to a hand-rolled structural check (GR-7: zero heavy dependencies): it
  * enforces the subset of Draft-07 the envelope actually uses — `type`,
- * `required`, `enum`, `const`, `minLength`, `minimum`, `format: uuid` — not the
- * whole specification.
+ * `required`, `enum`, `const`, `minLength`, `minimum`, `pattern`,
+ * `format: uuid` — not the whole specification.
+ *
+ * `pattern` is read as a JSON Schema / ECMA-262 regular expression: unanchored
+ * search semantics, with `^` and `$` inside the pattern marking the anchors
+ * (`$` matches only at the very end, never before a trailing newline). It is run
+ * through `preg_match` in Unicode mode; only the plain regular subset the
+ * envelope schema uses (character classes, quantifiers, anchors) is guaranteed
+ * to mean the same thing in both dialects.
  */
 final class SchemaValidator
 {
@@ -39,6 +46,10 @@ final class SchemaValidator
     public const REASON_NOT_IN_ENUM = 'not_in_enum';
     public const REASON_WRONG_CONST = 'wrong_const';
     public const REASON_BELOW_MINIMUM = 'below_minimum';
+    public const REASON_PATTERN_MISMATCH = 'pattern';
+
+    /** Candidate `preg_match` delimiters; the first one absent from a pattern is used. */
+    private const PATTERN_DELIMITERS = ['~', '#', '%', '@', '!', '`', ';', ','];
 
     /** RFC 4122 textual UUID, as the schema's `format: uuid` requires. */
     private const UUID_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i';
@@ -191,7 +202,7 @@ final class SchemaValidator
     }
 
     /**
-     * `minLength` and `format: uuid` string constraints.
+     * `minLength`, `pattern` and `format: uuid` string constraints.
      *
      * @param  array<string, mixed>  $schema
      */
@@ -201,11 +212,51 @@ final class SchemaValidator
             return self::violation($path, self::REASON_EMPTY_STRING);
         }
 
+        if (isset($schema['pattern']) && is_string($schema['pattern']) && ! self::matchesPattern($schema['pattern'], $value)) {
+            return self::violation($path, self::REASON_PATTERN_MISMATCH);
+        }
+
         if (($schema['format'] ?? null) === 'uuid' && preg_match(self::UUID_PATTERN, $value) !== 1) {
             return self::violation($path, self::REASON_NOT_UUID);
         }
 
         return null;
+    }
+
+    /**
+     * Whether `$value` matches the ECMA-262 style `$pattern` (search semantics).
+     *
+     * The `u` flag makes the pattern operate on code points; `D` keeps `$` from
+     * matching before a trailing newline, as it does in ECMA-262. A subject that
+     * is not valid UTF-8 cannot match. A pattern that does not compile is a defect
+     * in the schema, not in the envelope, so it throws rather than silently
+     * accepting (or rejecting) every value.
+     *
+     * @throws \LogicException when the pattern cannot be compiled
+     */
+    private static function matchesPattern(string $pattern, string $value): bool
+    {
+        $delimiter = null;
+        foreach (self::PATTERN_DELIMITERS as $candidate) {
+            if (! str_contains($pattern, $candidate)) {
+                $delimiter = $candidate;
+                break;
+            }
+        }
+
+        if ($delimiter === null) {
+            throw new \LogicException(sprintf('Schema pattern %s cannot be delimited for preg_match.', json_encode($pattern)));
+        }
+
+        $regex = $delimiter . $pattern . $delimiter . 'uD';
+
+        // preg_match() warns on a malformed pattern; the empty-subject probe tells
+        // a compile failure (false) apart from a plain non-match (0).
+        if (@preg_match($regex, '') === false) {
+            throw new \LogicException(sprintf('Schema pattern %s is not a valid regular expression.', json_encode($pattern)));
+        }
+
+        return preg_match($regex, $value) === 1;
     }
 
     /**
